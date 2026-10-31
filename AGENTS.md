@@ -172,6 +172,8 @@ ADRs are required for: owned data instead of references (5.1), any `unsafe`
   `refactor`, `docs`, `test`, `perf`, `chore`, `ci`.
 - One logical change per commit, with an imperative subject of 72 characters or less.
 - Haiku drafts the message; the owner approves it before the commit is created.
+- No AI attribution: never add `Co-Authored-By` trailers for Claude or any
+  other AI to commits or PRs.
 
 ## 9. Decisions already made
 

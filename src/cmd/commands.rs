@@ -1,16 +1,20 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
-// Program for a key - value database
+/// Program for a key - value database
 #[derive(Parser, Debug)]
-#[command(version = "0.1", name = "storage-engine", about, long_about = None)]
+#[command(
+    no_binary_name = true,
+    name = "storage-engine",
+    about,
+    long_about = None,
+    disable_version_flag = true
+)]
 pub struct Cmd {
-    // #[arg(short, long, value_name = "KEY", help = "Key to get from database")]
-    // get: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Subcommand)]
 pub enum Command {
     Get { key: String },
     Set { key: String, value: String },

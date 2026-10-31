@@ -1,3 +1,3 @@
-mod storage;
+mod memory;
 
-pub use storage::Storage;
+pub use memory::Storage;
