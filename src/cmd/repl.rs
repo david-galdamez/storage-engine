@@ -2,7 +2,9 @@ use std::io::Write;
 
 use clap::Parser;
 
-use crate::{cmd::commands, storage};
+use storage_engine_rs::storage;
+
+use crate::cmd::commands;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ReplError {
