@@ -192,9 +192,9 @@ ADRs are required for: owned data instead of references (5.1), any `unsafe`
 | Networking            | Async `tokio`, custom binary protocol                 |
 | Binaries              | Separate server and client (the REPL is temporary)    |
 | Vectors               | Dedicated vector tables (future)                      |
+| Page size             | 4 KiB default, stored in file header (ADR 0001)       |
 
 ## 10. Open decisions
 
 - Concurrency control: MVCC vs. locking (page-level or collection-level).
-- Page size (4 KiB vs. 8 KiB).
 - Project name and license.
