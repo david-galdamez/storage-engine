@@ -6,6 +6,7 @@ pub struct Storage {
 }
 
 impl Storage {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             data: HashMap::new(),
@@ -26,5 +27,11 @@ impl Storage {
 
     pub fn scan(&self) -> impl Iterator<Item = (&str, &str)> {
         self.data.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self::new()
     }
 }
