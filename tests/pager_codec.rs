@@ -122,7 +122,7 @@ fn write_past_the_end_is_out_of_bounds_and_leaves_buffer_unchanged() {
         })
     ));
     // A failed write must not write anything, not even the bytes that fit.
-    assert!(buf == [0xAAu8; 10]);
+    assert_eq!(buf, [0xAAu8; 10]);
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn write_bytes_past_the_end_is_out_of_bounds_and_leaves_buffer_unchanged() {
             buf_len: 4
         })
     ));
-    assert!(buf == [0u8; 4]);
+    assert_eq!(buf, [0u8; 4]);
 }
 
 #[test]

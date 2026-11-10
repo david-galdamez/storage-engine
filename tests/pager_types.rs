@@ -40,7 +40,7 @@ fn page_size_rejects_invalid_values() {
 
 #[test]
 fn page_size_default_is_4_kib() {
-    assert!(PageSize::default().get() == 4096);
+    assert_eq!(PageSize::default().get(), 4096);
 }
 
 proptest! {
@@ -57,8 +57,8 @@ proptest! {
 
 #[test]
 fn page_id_keeps_its_number() {
-    assert!(PageId::new(7).get() == 7);
-    assert!(PageId::HEADER.get() == 0);
+    assert_eq!(PageId::new(7).get(), 7);
+    assert_eq!(PageId::HEADER.get(), 0);
 }
 
 #[test]
@@ -87,13 +87,13 @@ fn page_id_offset_does_not_overflow_at_the_limits() -> anyhow::Result<()> {
 #[test]
 fn zero_on_disk_means_no_page() {
     assert!(PageId::from_disk(0).is_none());
-    assert!(PageId::to_disk(None) == 0);
+    assert_eq!(PageId::to_disk(None), 0);
 }
 
 #[test]
 fn nonzero_on_disk_is_a_page() {
     assert!(matches!(PageId::from_disk(5), Some(id) if id.get() == 5));
-    assert!(PageId::to_disk(Some(PageId::new(9))) == 9);
+    assert_eq!(PageId::to_disk(Some(PageId::new(9))), 9);
 }
 
 proptest! {
