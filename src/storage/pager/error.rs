@@ -1,6 +1,6 @@
 //! Typed errors for the pager.
 
-use crate::storage::pager::types::PageId;
+use crate::storage::pager::{page::PageType, types::PageId};
 
 /// Errors from encoding, decoding, and validating page contents in memory (no I/O).
 #[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
@@ -18,6 +18,19 @@ pub enum PageError {
     /// The page size is not a power of two in `[512, 65536]`. Field `size` is the rejected value.
     #[error("Invalid size: {size}")]
     InvalidPageSize { size: u32 },
+
+    /// The page type byte is not a known [`PageType`]. Field `value` is the byte read.
+    #[error("Unknown page type: {value}")]
+    UnknownPageType { value: u8 },
+
+    /// The page has a valid type, but not the one the caller needs.
+    #[error("Unexpected page type, expected: {expected} - found: {found}")]
+    UnexpectedPageType { expected: PageType, found: PageType },
+
+    /// The stored checksum does not match the page contents. Field `stored` is
+    /// the value at offset 0; field `computed` is the CRC32 of `[4, len)`.
+    #[error("Checksum mismatch, stored: {stored:#010x} - computed: {computed:#010x}")]
+    ChecksumMismatch { stored: u32, computed: u32 },
 }
 
 /// Errors from the file-backed pager.
