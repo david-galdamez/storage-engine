@@ -1,61 +1,20 @@
-//! Step 5 (TDD): database file header, stored in page 0 (ADR 0003).
+//! Tests for the database file header (`storage::pager::file_header`, step 5).
 //!
-//! Page 0 starts with the common page header (step 4) with page type
-//! `FileHeader`. The file header follows it:
+//! The byte layout is documented in `src/storage/pager/file_header.rs` and in
+//! ADR 0003. These tests check:
 //!
-//! | Offset | Size | Field                                                    |
-//! |--------|------|----------------------------------------------------------|
-//! | 16     | 8    | magic: `STENGDB\0`                                       |
-//! | 24     | 2    | `format_version`: u16 = 1                                |
-//! | 26     | 2    | reserved                                                 |
-//! | 28     | 4    | `page_size`: u32 (ADR 0001)                              |
-//! | 32     | 4    | `page_count`: u32, >= 1, includes page 0                 |
-//! | 36     | 4    | `freelist_head`: u32, 0 = empty, otherwise < `page_count` |
-//! | 40     | 4    | `freelist_count`: u32, 0 if and only if head is 0, <= `page_count` - 1 |
-//! | 44     | rest | reserved                                                 |
-//!
-//! All integers are little-endian.
-//!
-//! API under test (module `storage::pager::file_header`):
-//!
-//! - `MAGIC: [u8; 8] = *b"STENGDB\0"`
-//! - `FORMAT_VERSION: u16 = 1`
-//! - `FILE_HEADER_END: usize = 44`: first byte after the file header
-//! - `FileHeader` with public fields `page_size: PageSize`, `page_count: u32`,
-//!   `freelist_head: Option<PageId>`, `freelist_count: u32`. Needs `Debug`,
-//!   `Clone`, `Copy`, `PartialEq`, `Eq`.
-//! - `FileHeader::new(PageSize) -> FileHeader`: header of a new database, with
-//!   only page 0 and an empty free list.
-//! - `FileHeader::encode(&self, &mut [u8]) -> Result<(), PageError>`:
-//!   - zeroes every byte from offset 4 to the end of the buffer, then writes
-//!     page type `FileHeader` and the fields;
-//!   - never touches the checksum `[0, 4)`, because the pager stamps it later;
-//!   - a buffer shorter than `FILE_HEADER_END` gives `OutOfBounds` and is left
-//!     unchanged.
-//! - `FileHeader::decode(&[u8]) -> Result<FileHeader, PageError>`:
-//!   - works on any buffer of at least `FILE_HEADER_END` bytes, because
-//!     `Pager::open` reads only a 512-byte prefix before it knows the page size;
-//!   - does not verify the checksum (the pager does that with the full page) and
-//!     ignores the LSN and the reserved bytes;
-//!   - checks in this order, and returns the first failure:
-//!     1. buffer length: `OutOfBounds`
-//!     2. magic: `BadMagic`
-//!     3. version: `UnsupportedVersion`
-//!     4. page size: `InvalidPageSize` (from `PageSize::new`)
-//!     5. page type: `UnknownPageType` or `UnexpectedPageType`
-//!     6. rules between fields: `CorruptHeader`
-//!
-//! New `PageError` variants:
-//!
-//! - `BadMagic { found: [u8; 8] }`: the bytes read instead of the magic.
-//! - `UnsupportedVersion { version: u16 }`
-//! - `CorruptHeader { reason: &'static str }`: the reason text is free; the
-//!   tests do not check it.
-//!
-//! Why this order: a file that is not a database at all should say so (bad
-//! magic) before anything else. A file from a newer version may use a different
-//! layout, so no field after the version can be trusted until the version is
-//! known.
+//! - `encode` writes every field at its offset, zeroes the rest of the page
+//!   from offset 4, and never touches the checksum.
+//! - `decode` round-trips every valid header and works on a 44-byte prefix,
+//!   because `Pager::open` reads only a 512-byte prefix before it knows the
+//!   page size. It ignores the checksum, the LSN and the reserved bytes.
+//! - `decode` returns the first failing check, in this order: length, magic,
+//!   version, page size, page type, field rules. A file that is not a database
+//!   says so before anything else, and no field after the version is trusted
+//!   until the version is known.
+//! - The field rules accept exactly the combinations ADR 0003 allows. A
+//!   property test checks every small `(page_count, head, count)`.
+//! - Random bytes never make `decode` panic.
 
 use anyhow::{Context, ensure};
 use proptest::prelude::*;

@@ -1,48 +1,22 @@
-//! Step 4 (TDD): common page header (ADR 0003).
+//! Tests for the common page header (`storage::pager::page`, step 4).
 //!
-//! Every page, including page 0, starts with the same 16 bytes:
+//! The byte layout is documented in `src/storage/pager/page.rs` and in
+//! ADR 0003. These tests check the behavior the rest of the pager relies on:
 //!
-//! | Offset | Size | Field                                         |
-//! |--------|------|-----------------------------------------------|
-//! | 0      | 4    | checksum: u32, CRC32 of bytes `[4, len)`      |
-//! | 4      | 1    | `page_type`: u8 (1 `FileHeader`, 2 Free, 3 Slotted) |
-//! | 5      | 3    | reserved                                      |
-//! | 8      | 8    | `page_lsn`: u64 (0 until the WAL exists)      |
+//! - `PageType` round-trips through `u8`. Only 1, 2 and 3 are valid, so a
+//!   zero-filled page is never taken for a real one.
+//! - Each setter writes only its own field, in little-endian.
+//! - The checksum is the CRC32 of `[4, len)`, stored at `[0, 4)`. Any changed
+//!   byte, including a checksum byte, fails verification, and so does any
+//!   change made after stamping.
+//! - Errors carry the values needed to debug them (`stored` and `computed`,
+//!   `expected` and `found`).
+//! - A buffer shorter than the 16-byte header is an error in every function,
+//!   never a panic, and a failed setter leaves the buffer unchanged.
 //!
-//! All integers are little-endian. The functions are pure (no I/O). They work
-//! on any buffer of at least `COMMON_HEADER_SIZE` bytes, and "the page" is
-//! the whole slice: the checksum covers `[4, buf.len())`. A shorter buffer is
-//! an error in every function, never a panic.
-//!
-//! API under test (module `storage::pager::page`):
-//!
-//! - `COMMON_HEADER_SIZE: usize = 16`
-//! - `PageType` enum: `FileHeader`, `Free`, `Slotted`. Needs `Debug`, `Clone`,
-//!   `Copy`, `PartialEq`, `Eq`. Byte 0 is not a variant: it means "invalid",
-//!   so a zero-filled page is never mistaken for a real one.
-//! - `impl TryFrom<u8> for PageType` with `Error = PageError`
-//! - `impl From<PageType> for u8`
-//! - `page_type(&[u8]) -> Result<PageType, PageError>`
-//! - `set_page_type(&mut [u8], PageType) -> Result<(), PageError>`
-//! - `page_lsn(&[u8]) -> Result<u64, PageError>`
-//! - `set_page_lsn(&mut [u8], u64) -> Result<(), PageError>`
-//! - `compute_checksum(&[u8]) -> Result<u32, PageError>`: CRC32 of `[4, len)`,
-//!   does not read the stored checksum
-//! - `stamp_checksum(&mut [u8]) -> Result<(), PageError>`: writes
-//!   `compute_checksum` into `[0, 4)`
-//! - `verify_checksum(&[u8]) -> Result<(), PageError>`
-//! - `expect_page_type(&[u8], PageType) -> Result<(), PageError>`
-//!
-//! Setters only touch their own field. They do not zero the reserved bytes and
-//! do not update the checksum.
-//!
-//! New `PageError` variants:
-//!
-//! - `UnknownPageType { value: u8 }`
-//! - `UnexpectedPageType { expected: PageType, found: PageType }`
-//! - `ChecksumMismatch { stored: u32, computed: u32 }`
-//!
-//! A buffer shorter than 16 bytes gives `PageError::OutOfBounds { .. }`.
+//! Expected values do not come from the code under test: offsets are written
+//! as literals, and checksums come from `crc32` (step 3) or from Python's
+//! `zlib.crc32`.
 
 use anyhow::{Context, ensure};
 use proptest::prelude::*;

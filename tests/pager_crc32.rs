@@ -1,20 +1,16 @@
-//! Step 3 (TDD): hand-written CRC32 for page checksums.
+//! Tests for the hand-written CRC32 (`storage::pager::crc32`, step 3).
 //!
 //! The variant is CRC-32/ISO-HDLC, the one used by zlib, gzip, PNG and
-//! Ethernet (ADR 0003):
+//! Ethernet (ADR 0003). These tests check:
 //!
-//! - reflected polynomial `0xEDB8_8320`
-//! - initial value `0xFFFF_FFFF`
-//! - final XOR `0xFFFF_FFFF`
+//! - Known vectors, including the standard check value of `"123456789"`.
+//!   If it matches, the polynomial, initial value and final XOR are right.
+//! - The incremental `Crc32` gives the same result as one `crc32` call, however
+//!   the input is split.
+//! - Flipping any single bit changes the checksum.
 //!
-//! Every expected value below was computed with Python's `zlib.crc32`, an
+//! Every expected value was computed with Python's `zlib.crc32`, an
 //! independent implementation.
-//!
-//! API under test:
-//! - `crc32(&[u8]) -> u32`: checksum of a whole buffer in one call.
-//! - `Crc32`: incremental version. `new()`, then `update(&[u8])` any number of
-//!   times, then `finalize() -> u32`. Needed later for data that is not
-//!   contiguous in memory (for example a WAL record header plus its payload).
 
 use anyhow::ensure;
 use proptest::prelude::*;

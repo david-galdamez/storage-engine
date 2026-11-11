@@ -1,9 +1,13 @@
-//! Step 2 (TDD): page identifiers and page sizes.
+//! Tests for page identifiers and page sizes (`storage::pager::types`, step 2).
 //!
-//! - `PageSize` can only hold a valid size (ADR 0001): a power of two in
-//!   [512, 65536]. Any other value is rejected when it is created.
-//! - `PageId` numbers a page. On disk, 0 means "no page", because page 0 is
-//!   the file header and is never the target of a link (ADR 0003).
+//! These tests check:
+//!
+//! - `PageSize` accepts exactly the sizes allowed by ADR 0001: powers of two
+//!   in `[512, 65536]`. Any other value is rejected when it is created.
+//! - `PageId::offset` gives the byte offset of a page in the file and does not
+//!   overflow, even at the largest page id and page size.
+//! - On disk, page id 0 means "no page", because page 0 is the file header and
+//!   is never the target of a link (ADR 0003). It decodes to `None`.
 
 use anyhow::{Context, ensure};
 use proptest::prelude::*;
