@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0b186721c5de5aed76bad665185c346c0709c51cf025348f61a3dae3d585655c # shrinks to page_count = 0, head = 0, count = 0
+cc cf3333197eccf83be0e39ef1e3b2599fd702394084aed2dcf0c966040ddaa7d7 # shrinks to header = FileHeader { page_size: PageSize { size: 512, len: 512 }, page_count: 1, freelist_head: None, freelist_count: 0 }
+cc 9ae8d63d03ed7e02decd4c633368beea4ccd832db45734d79c5d6c0b3101cf8a # shrinks to page_count = 2, head = 2, count = 0

@@ -31,6 +31,23 @@ pub enum PageError {
     /// the value at offset 0; field `computed` is the CRC32 of `[4, len)`.
     #[error("Checksum mismatch, stored: {stored:#010x} - computed: {computed:#010x}")]
     ChecksumMismatch { stored: u32, computed: u32 },
+
+    /// Page 0 does not start with the database magic number, so the file is not
+    /// a database of this engine (or its first page is destroyed). Field `found`
+    /// holds the 8 bytes read instead of the magic.
+    #[error("Bad magic: expected \"STENGDB\\0\", found {found:02x?}")]
+    BadMagic { found: [u8; 8] },
+
+    /// The file was written with a format version this build cannot read.
+    /// Field `version` is the version stored in the file header.
+    #[error("Unsupported format version: {version}")]
+    UnsupportedVersion { version: u16 },
+
+    /// The file header fields contradict each other (ADR 0003 rules), for
+    /// example a free list head past the end of the file. Field `reason` names
+    /// the rule that failed.
+    #[error("Corrupt file header: {reason}")]
+    CorruptHeader { reason: &'static str },
 }
 
 /// Errors from the file-backed pager.

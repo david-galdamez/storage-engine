@@ -24,7 +24,8 @@ use crate::storage::pager::{
 /// Size in bytes of the header shared by every page.
 pub const COMMON_HEADER_SIZE: usize = 16;
 const CHECKSUM_OFFSET: usize = 0;
-const CHECKSUM_END: usize = 4;
+/// First byte covered by the checksum: the checksum protects `[CHECKSUM_END, len)`.
+pub const CHECKSUM_END: usize = 4;
 const PAGE_TYPE_OFFSET: usize = 4;
 const PAGE_LSN_OFFSET: usize = 8;
 
