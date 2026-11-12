@@ -97,4 +97,7 @@ pub enum PagerError {
     /// largest number of pages a page id can address.
     #[error("Database is full")]
     DatabaseFull,
+
+    #[error("Free list with page_id : {page} is corrupted: {reason}")]
+    FreeListCorrupted { page: PageId, reason: &'static str },
 }
