@@ -298,6 +298,44 @@ impl Pager {
     }
 
     pub fn verify_freelist(&self) -> Result<(), PagerError> {
+        let mut current = self.file_header.freelist_head;
+        let mut holder = None;
+        let buffer = vec![0u8; self.page_size().as_usize()];
+
+        for _ in 0..self.free_page_count() {
+            if current.is_none() {
+                return Err(PagerError::FreeListCorrupted {
+                    page: PageId::new(0),
+                    reason: "list is smaller than list_count",
+                });
+            }
+
+            if let Some(head) = current {
+                if head.get() >= self.free_page_count() {
+                    return Err(PagerError::FreeListCorrupted {
+                        page: holder.unwrap_or(PageId::new(0)),
+                        reason: "",
+                    });
+                }
+
+                let next =
+                    decode_free_page(&buffer).map_err(|_| PagerError::FreeListCorrupted {
+                        page: head,
+                        reason: "error decoding free list",
+                    })?;
+
+                holder = current;
+                current = next;
+            }
+        }
+
+        if let Some(curr) = current {
+            return Err(PagerError::FreeListCorrupted {
+                page: curr,
+                reason: "list larger than count",
+            });
+        }
+
         Ok(())
     }
 
