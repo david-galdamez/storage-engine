@@ -97,4 +97,13 @@ pub enum PagerError {
     /// largest number of pages a page id can address.
     #[error("Database is full")]
     DatabaseFull,
+
+    /// The free list does not match the file header: a page in it is not a
+    /// free page, a `next_free` link points past the end of the file, or the
+    /// list is shorter or longer than `freelist_count` (a double free shows
+    /// up as a cycle, so as a list that is too long). Field `page` is the page
+    /// that holds the bad link, or 0 when it is the file header; field
+    /// `reason` names the check that failed.
+    #[error("Free list with page_id : {page} is corrupted: {reason}")]
+    FreelistCorrupted { page: PageId, reason: &'static str },
 }

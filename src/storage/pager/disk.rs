@@ -9,6 +9,7 @@ use std::{
 use crate::storage::pager::{
     error::PagerError,
     file_header::FileHeader,
+    freelist::{decode_free_page, encode_free_page},
     page::{stamp_checksum, verify_checksum},
     types::{PageId, PageSize},
 };
@@ -216,13 +217,35 @@ impl Pager {
         Ok(())
     }
 
-    /// Grows the file by one page, writes the new `page_count` to the file
-    /// header, and returns the id of the new page.
+    /// Returns the id of a page the caller can write.
     ///
-    /// The new page is filled with zeros, so reading it fails the checksum
-    /// until its first [`Pager::write_page`]. Does not sync.
+    /// If the free list is not empty, pops its head: reads the head page,
+    /// takes its `next_free` link as the new head, and writes the file header
+    /// with `freelist_count - 1`. The file does not grow. The returned page
+    /// still holds the old free page until the caller writes it.
+    ///
+    /// If the free list is empty, grows the file by one page and writes the
+    /// new `page_count` to the file header. The new page is filled with zeros,
+    /// so reading it fails the checksum until its first
+    /// [`Pager::write_page`].
+    ///
+    /// Does not sync.
     ///
     /// # Errors
+    ///
+    /// When popping the free list, the file and the pager are left unchanged
+    /// on every error:
+    ///
+    /// - [`PagerError::Corrupted`] with the head page if its checksum is
+    ///   wrong.
+    /// - [`PagerError::FreelistCorrupted`] with the head page if it is not a
+    ///   free page, if its `next_free` is not below `page_count`, or if
+    ///   `next_free` does not agree with the new `freelist_count` (set when
+    ///   the count reaches 0, or missing when it does not).
+    /// - [`PagerError::Io`] if reading the head or writing the file header
+    ///   fails.
+    ///
+    /// When growing the file:
     ///
     /// - [`PagerError::DatabaseFull`] if `page_count` is already `u32::MAX`.
     /// - [`PagerError::Io`] if growing the file or writing the file header
@@ -230,8 +253,53 @@ impl Pager {
     ///   already be one page longer, so a later [`Pager::open`] can fail with
     ///   [`PagerError::FileSizeMismatch`].
     pub fn allocate_page(&mut self) -> Result<PageId, PagerError> {
-        let page_id = PageId::new(self.file_header.page_count);
+        if self.file_header.freelist_count != 0
+            && let Some(head) = self.file_header.freelist_head
+        {
+            let mut buffer = vec![0u8; self.page_size().as_usize()];
+            self.read_page(head, &mut buffer)?;
 
+            let next_free_page_id =
+                decode_free_page(&buffer).map_err(|_| PagerError::FreelistCorrupted {
+                    page: head,
+                    reason: "page is not a free_page",
+                })?;
+            let new_count = self.file_header.freelist_count.saturating_sub(1);
+            if let Some(page_id) = next_free_page_id {
+                if page_id.get() >= self.file_header.page_count {
+                    return Err(PagerError::FreelistCorrupted {
+                        page: head,
+                        reason: "page_id is greater than page_count",
+                    });
+                }
+
+                if new_count == 0 {
+                    return Err(PagerError::FreelistCorrupted {
+                        page: head,
+                        reason: "free_list_count is 0 but head is set",
+                    });
+                }
+            }
+
+            if next_free_page_id.is_none() && new_count > 0 {
+                return Err(PagerError::FreelistCorrupted {
+                    page: head,
+                    reason: "page_id is none and new_count is greater than 0",
+                });
+            }
+
+            let mut file_header = self.file_header;
+            file_header.freelist_head = next_free_page_id;
+            file_header.freelist_count = new_count;
+
+            self.write_header(&file_header)?;
+
+            self.file_header = file_header;
+
+            return Ok(head);
+        }
+
+        let page_id = PageId::new(self.file_header.page_count);
         let mut file_header = self.file_header;
         file_header.page_count = self
             .file_header
@@ -252,6 +320,64 @@ impl Pager {
         Ok(page_id)
     }
 
+    /// Walks the free list from the head and checks that it matches the file
+    /// header: exactly `freelist_count` pages, each one below `page_count`
+    /// and a valid free page, with no page twice. Changes nothing.
+    ///
+    /// Follows at most `freelist_count` links, so it never loops forever: a
+    /// cycle (for example from freeing the same page twice) never reaches the
+    /// end of the list and is reported as a list longer than the count.
+    ///
+    /// # Errors
+    ///
+    /// - [`PagerError::Corrupted`] with the page whose checksum is wrong.
+    /// - [`PagerError::FreelistCorrupted`] if a page is not a free page
+    ///   (`page` is that page), a link points past the end of the file
+    ///   (`page` is the page that holds the link, or 0 for the file header),
+    ///   or the list is shorter or longer than `freelist_count`.
+    /// - [`PagerError::Io`] if a read fails.
+    pub fn verify_freelist(&self) -> Result<(), PagerError> {
+        let mut current = self.file_header.freelist_head;
+        let mut holder = None;
+        let mut buffer = vec![0u8; self.page_size().as_usize()];
+
+        for _ in 0..self.free_page_count() {
+            if let Some(head) = current {
+                if head.get() >= self.page_count() {
+                    return Err(PagerError::FreelistCorrupted {
+                        page: holder.unwrap_or(PageId::HEADER),
+                        reason: "head out of page range",
+                    });
+                }
+
+                self.read_page(head, &mut buffer)?;
+
+                let next =
+                    decode_free_page(&buffer).map_err(|_| PagerError::FreelistCorrupted {
+                        page: head,
+                        reason: "error decoding free list",
+                    })?;
+
+                holder = current;
+                current = next;
+            } else {
+                return Err(PagerError::FreelistCorrupted {
+                    page: holder.unwrap_or(PageId::HEADER),
+                    reason: "list is smaller than freelist_count",
+                });
+            }
+        }
+
+        if let Some(curr) = current {
+            return Err(PagerError::FreelistCorrupted {
+                page: curr,
+                reason: "list larger than count",
+            });
+        }
+
+        Ok(())
+    }
+
     /// Flushes every write to the file down to the disk (`fsync`), so it
     /// survives a crash or power loss.
     ///
@@ -263,6 +389,61 @@ impl Pager {
         self.file.sync_all()?;
 
         Ok(())
+    }
+
+    /// Pushes `page` onto the free list so a later [`Pager::allocate_page`]
+    /// can reuse it.
+    ///
+    /// Writes the page first, as a free page linked to the current head, and
+    /// then the file header with `page` as the new head and
+    /// `freelist_count + 1` (ADR 0003). Does not read the page, so it cannot
+    /// detect a double free: freeing a page twice links it to itself, and
+    /// [`Pager::verify_freelist`] reports the cycle. Does not sync.
+    ///
+    /// The two writes are not atomic. A crash between them leaves the page
+    /// marked free but outside the list, so it is leaked until the WAL exists.
+    ///
+    /// # Errors
+    ///
+    /// - [`PagerError::ReservedPage`] if `page` is 0 (the file header).
+    /// - [`PagerError::PageOutOfBounds`] if `page` is not below `page_count`.
+    ///   In both cases nothing is written.
+    /// - [`PagerError::Io`] if writing the page or the file header fails. The
+    ///   in-memory header does not change.
+    pub fn free_page(&mut self, page: PageId) -> Result<(), PagerError> {
+        let page_id = page.get();
+        if page_id == 0 {
+            return Err(PagerError::ReservedPage { page });
+        }
+
+        if page_id >= self.page_count() {
+            return Err(PagerError::PageOutOfBounds {
+                page,
+                page_count: self.page_count(),
+            });
+        }
+
+        let mut file_header = self.file_header;
+        let mut buffer = vec![0u8; self.page_size().as_usize()];
+
+        encode_free_page(&mut buffer, self.file_header.freelist_head)?;
+        self.write_page(page, &mut buffer)?;
+
+        let free_list_cont = self.file_header.freelist_count.saturating_add(1);
+        file_header.freelist_count = free_list_cont;
+        file_header.freelist_head = Some(page);
+
+        self.write_header(&file_header)?;
+        self.file_header = file_header;
+
+        Ok(())
+    }
+
+    /// Returns the number of pages in the free list (`freelist_count` in the
+    /// file header).
+    #[must_use]
+    pub const fn free_page_count(&self) -> u32 {
+        self.file_header.freelist_count
     }
 
     /// Encodes `header` into the scratch buffer, stamps its checksum, and
