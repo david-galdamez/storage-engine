@@ -1,7 +1,14 @@
-//! Step 2 (TDD): little-endian byte codec for page buffers.
+//! Tests for the little-endian byte codec (`storage::pager::codec`, step 2).
 //!
-//! Every function takes a buffer and an offset, and must return an error
-//! instead of panicking when the access does not fit in the buffer.
+//! These tests check:
+//!
+//! - Integers are written and read in little-endian, at any offset.
+//! - A write touches only its own bytes.
+//! - Any access that does not fit in the buffer returns `OutOfBounds`, never a
+//!   panic. This includes an offset equal to the length, an empty buffer, and
+//!   an offset near `usize::MAX`, where `offset + len` would overflow.
+//! - A failed write leaves the buffer unchanged.
+//! - `slice` borrows from the buffer without copying.
 
 use anyhow::{Context, ensure};
 use proptest::prelude::*;
@@ -122,7 +129,7 @@ fn write_past_the_end_is_out_of_bounds_and_leaves_buffer_unchanged() {
         })
     ));
     // A failed write must not write anything, not even the bytes that fit.
-    assert!(buf == [0xAAu8; 10]);
+    assert_eq!(buf, [0xAAu8; 10]);
 }
 
 #[test]
@@ -189,7 +196,7 @@ fn write_bytes_past_the_end_is_out_of_bounds_and_leaves_buffer_unchanged() {
             buf_len: 4
         })
     ));
-    assert!(buf == [0u8; 4]);
+    assert_eq!(buf, [0u8; 4]);
 }
 
 #[test]
