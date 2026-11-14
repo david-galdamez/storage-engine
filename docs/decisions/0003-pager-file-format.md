@@ -164,6 +164,8 @@ Slotted page invariants:
    Otherwise the insert fails with a "page full" error.
 6. After compaction, `fragmented_bytes == 0`, cells are contiguous, and logical
    order and contents are unchanged.
+7. Removing a cell zeroes its dead bytes and the freed slot entry, and deletes
+   never move `free_end`: only compaction reclaims the space.
 
 Pager behavior:
 
