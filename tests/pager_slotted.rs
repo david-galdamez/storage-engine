@@ -1,4 +1,4 @@
-//! Tests for the slotted page (`storage::pager::slotted`, step 8).
+//! Tests for the slotted page (`storage::pager::slotted`, steps 8 and 9).
 //!
 //! The byte layout is documented in ADR 0003. These tests check:
 //!
@@ -14,14 +14,27 @@
 //!   insert or remove leaves the buffer byte-for-byte unchanged.
 //! - `remove` shifts the slots, adds the cell length to `fragmented_bytes`,
 //!   zeroes the dead bytes and the stale slot, and never moves `free_end`.
-//!   Fragmented space is not reused by `insert` yet (compaction is step 9).
+//! - `compact` (step 9) rewrites the live cells in logical order from low to
+//!   high addresses: cell 0 starts at the new `free_end` and the last cell
+//!   ends at the page end, with no holes. It updates the slot offsets, sets
+//!   `fragmented_bytes` to 0, zeroes the rest of the page body, and keeps the
+//!   slot order and cell contents. The result depends only on the cells, not
+//!   on the history of the page, so `compact` reorders cells even when
+//!   `fragmented_bytes` is 0. It validates the whole page first and writes
+//!   nothing on a corrupt page.
+//! - `insert` compacts first only when the cell does not fit in the contiguous
+//!   free space but fits in the total free space. Then the new cell goes to
+//!   `free_end` as usual. `PageFull` now means the cell does not fit even
+//!   after compaction.
+//! - The free gap `[free_start, free_end)` is always all zeros.
 //! - `search_by` behaves like `slice::binary_search_by`.
 //! - Corrupted pages (bad header fields, bad slots, a sum mismatch) are always
 //!   an `Err`, never a panic, and mutations on them write nothing.
 //! - Every operation keeps the invariants I1 to I4 of ADR 0003. They are
 //!   checked from the raw bytes by `check_invariants`, not through the API.
-//!   Two property tests check random bytes (no panics) and random inserts
-//!   against a `Vec` model.
+//!   Property tests check random bytes (no panics), random inserts against a
+//!   `Vec` model, and random inserts, removes and compactions against a model
+//!   that predicts which inserts must fit.
 //!
 //! Expected values do not come from the code under test: offsets and encoded
 //! bytes are written as literals (little-endian).
@@ -45,6 +58,7 @@
 //! SlottedPageMut::init(&mut [u8]) / new(&mut [u8])  -> Result<_, PageError>
 //!   view()                                          -> SlottedPage<'_>
 //!   insert(usize, &[u8]) / remove(usize)            -> Result<(), PageError>
+//!   compact()                                       -> Result<(), PageError>
 //!
 //! New PageError variants: EmptyCell, CellTooLarge { len, max },
 //! SlotOutOfRange { index, cell_count }, PageFull { needed, contiguous,
@@ -156,6 +170,20 @@ fn remove(buf: &mut [u8], index: usize) -> Result<(), PageError> {
     SlottedPageMut::new(buf)?.remove(index)
 }
 
+fn compact(buf: &mut [u8]) -> Result<(), PageError> {
+    SlottedPageMut::new(buf)?.compact()
+}
+
+/// `compact` on a view, for `mut_view_rejects`.
+fn compact_view(page: &mut SlottedPageMut<'_>) -> Result<(), PageError> {
+    page.compact()
+}
+
+/// `free_start`, computed from the raw `cell_count`.
+fn free_start_of(buf: &[u8]) -> anyhow::Result<usize> {
+    add(OFF_SLOTS, mul(4, count_of(buf)?)?)
+}
+
 /// Every cell of the page, in logical order, copied out.
 fn cells_of(buf: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     let page = SlottedPage::new(buf)?;
@@ -174,6 +202,78 @@ fn two_cell_page() -> anyhow::Result<Vec<u8>> {
     insert(&mut buf, 0, b"ab")?;
     check_invariants(&buf)?;
     Ok(buf)
+}
+
+/// A 512-byte page with the live cells `hello` (index 0) and `ab` (index 1)
+/// and a 400-byte hole between them.
+///
+/// Built by inserting hello (507..512), a 400-byte cell (107..507) and ab
+/// (105..107), then removing the 400-byte cell. Slot 0 = [507, 5], slot 1 =
+/// [105, 2], `free_start` = 40, `free_end` = 105, `fragmented_bytes` = 400,
+/// `contiguous_free` = 65, `total_free` = 465.
+fn fragmented_page() -> anyhow::Result<Vec<u8>> {
+    let mut buf = empty_page(512)?;
+    insert(&mut buf, 0, b"hello")?;
+    insert(&mut buf, 1, &[0x33; 400])?;
+    insert(&mut buf, 2, b"ab")?;
+    remove(&mut buf, 1)?;
+    check_invariants(&buf)?;
+    ensure!(fragmented_of(&buf)? == 400, "fixture: fragmented_bytes");
+    ensure!(free_end_of(&buf)? == 105, "fixture: free_end");
+    Ok(buf)
+}
+
+/// The free gap `[free_start, free_end)` must be all zeros: `init` zeroes it,
+/// `remove` zeroes the slot it frees, and `compact` zeroes the bytes it vacates.
+fn check_free_gap_zeroed(buf: &[u8]) -> anyhow::Result<()> {
+    let free_start = free_start_of(buf)?;
+    let free_end = free_end_of(buf)?;
+    let gap = slice(buf, free_start, sub(free_end, free_start)?)?;
+    let first = gap.iter().position(|&b| b != 0);
+    ensure!(
+        first.is_none(),
+        "free gap [{free_start}, {free_end}) has a non-zero byte at {:?}",
+        first.map(|at| free_start.saturating_add(at))
+    );
+    Ok(())
+}
+
+/// I1 to I4 hold, `fragmented_bytes` is 0 and the free gap is zeroed. With I3
+/// and I4 this means the live cells fill `[free_end, size)` exactly, with no
+/// holes, in any physical order. This is the state after an insert that had
+/// to compact: the new cell sits at `free_end` whatever its logical index.
+fn check_no_holes(buf: &[u8]) -> anyhow::Result<()> {
+    check_invariants(buf)?;
+    let fragmented = fragmented_of(buf)?;
+    ensure!(
+        fragmented == 0,
+        "fragmented_bytes is {fragmented}, expected 0"
+    );
+    check_free_gap_zeroed(buf)
+}
+
+/// The layout right after `compact`, from the raw bytes: no holes, and the
+/// cells in logical order from low to high addresses. Cell 0 starts at
+/// `free_end`, each next cell starts where the previous one ends, and the
+/// last cell ends at the page end.
+fn check_compacted(buf: &[u8]) -> anyhow::Result<()> {
+    check_no_holes(buf)?;
+    let mut expected_offset = free_end_of(buf)?;
+    for i in 0..count_of(buf)? {
+        let at = add(OFF_SLOTS, mul(4, i)?)?;
+        let offset = usize::from(u16_at(buf, at)?);
+        let len = usize::from(u16_at(buf, add(at, 2)?)?);
+        ensure!(
+            offset == expected_offset,
+            "slot {i}: offset {offset}, expected {expected_offset} (logical order)"
+        );
+        expected_offset = add(offset, len)?;
+    }
+    ensure!(
+        expected_offset == buf.len(),
+        "the last cell ends at {expected_offset}, not at the page end"
+    );
+    Ok(())
 }
 
 /// Checks the invariants I1 to I4 of ADR 0003 from the raw bytes, without
@@ -860,24 +960,296 @@ fn remove_out_of_range_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Compaction (step 9)
+// ---------------------------------------------------------------------------
+
 #[test]
-fn insert_fails_when_only_fragmented_space_is_free() -> anyhow::Result<()> {
-    // Changes in step 9: insert will compact first.
+fn compact_rewrites_cells_in_logical_order() -> anyhow::Result<()> {
+    // Before: hello (cell 0) at 507..512, ab (cell 1) at 105..107.
+    // After: the 7 live bytes fill 505..512, cell 0 first: hello at 505..510,
+    // ab at 510..512. hello moves down even though it was already at the end.
+    let mut buf = fragmented_page()?;
+    compact(&mut buf)?;
+    check_compacted(&buf)?;
+    ensure!(slice(&buf, 505, 7)? == *b"helloab", "cell area");
+    // slot 0 = [505 = 0x01F9, 5], slot 1 = [510 = 0x01FE, 2]
+    ensure!(slice(&buf, 32, 4)? == [0xF9, 0x01, 0x05, 0x00], "slot 0");
+    ensure!(slice(&buf, 36, 4)? == [0xFE, 0x01, 0x02, 0x00], "slot 1");
+    ensure!(slice(&buf, 16, 2)? == [0x02, 0x00], "cell_count");
+    ensure!(slice(&buf, 18, 2)? == [0x00, 0x00], "fragmented_bytes");
+    ensure!(slice(&buf, 20, 4)? == [0xF9, 0x01, 0x00, 0x00], "free_end");
+    // Includes the old copy of ab at 105..107.
+    ensure!(
+        slice(&buf, 40, 465)?.iter().all(|&b| b == 0),
+        "[40, 505) not zeroed"
+    );
+    let page = SlottedPage::new(&buf)?;
+    ensure!(page.cell(0)? == b"hello", "cell(0)");
+    ensure!(page.cell(1)? == b"ab", "cell(1)");
+    ensure!(page.contiguous_free() == 465, "contiguous_free");
+    ensure!(page.total_free() == 465, "total_free");
+    page.validate()?;
+    Ok(())
+}
+
+#[test]
+fn compact_places_cell_zero_at_the_lowest_address() -> anyhow::Result<()> {
+    // Appends store each new cell below the previous one, so the physical
+    // order is the reverse of the logical order: aaa at 509, bbbb at 505,
+    // cc at 503, d at 502.
+    let mut buf = empty_page(512)?;
+    insert(&mut buf, 0, b"aaa")?;
+    insert(&mut buf, 1, b"bbbb")?;
+    insert(&mut buf, 2, b"cc")?;
+    insert(&mut buf, 3, b"d")?;
+    remove(&mut buf, 1)?; // bbbb: hole at 505..509
+    compact(&mut buf)?;
+    check_compacted(&buf)?;
+    // 6 live bytes fill 506..512 in logical order.
+    ensure!(slice(&buf, 506, 6)? == *b"aaaccd", "cell area");
+    // slot 0 = [506 = 0x01FA, 3], slot 1 = [509 = 0x01FD, 2],
+    // slot 2 = [511 = 0x01FF, 1]
+    ensure!(slice(&buf, 32, 4)? == [0xFA, 0x01, 0x03, 0x00], "slot 0");
+    ensure!(slice(&buf, 36, 4)? == [0xFD, 0x01, 0x02, 0x00], "slot 1");
+    ensure!(slice(&buf, 40, 4)? == [0xFF, 0x01, 0x01, 0x00], "slot 2");
+    ensure!(slice(&buf, 20, 4)? == [0xFA, 0x01, 0x00, 0x00], "free_end");
+    ensure!(
+        slice(&buf, 44, 462)?.iter().all(|&b| b == 0),
+        "[44, 506) not zeroed"
+    );
+    ensure!(
+        cells_of(&buf)? == vec![b"aaa".to_vec(), b"cc".to_vec(), b"d".to_vec()],
+        "logical order changed"
+    );
+    Ok(())
+}
+
+#[test]
+fn compact_orders_cells_even_without_fragmented_bytes() -> anyhow::Result<()> {
+    // Already in the compacted layout: nothing changes.
+    for buf in [empty_page(512)?, two_cell_page()?] {
+        let mut copy = buf.clone();
+        compact(&mut copy)?;
+        ensure!(copy == buf, "compact changed an already compacted page");
+    }
+    // hello (cell 0) at 507, ab (cell 1) at 505: no holes, but the physical
+    // order is reversed, so compact rewrites it.
+    let mut buf = empty_page(512)?;
+    insert(&mut buf, 0, b"hello")?;
+    insert(&mut buf, 1, b"ab")?;
+    ensure!(fragmented_of(&buf)? == 0, "fixture has fragmented bytes");
+    compact(&mut buf)?;
+    check_compacted(&buf)?;
+    ensure!(slice(&buf, 505, 7)? == *b"helloab", "cell area");
+    Ok(())
+}
+
+#[test]
+fn compact_gives_the_same_bytes_for_the_same_cells() -> anyhow::Result<()> {
+    // Two pages with the cells hello, ab built by different histories: one
+    // with a 400-byte hole, one by plain appends. After compact they are
+    // byte-for-byte equal.
+    let mut with_hole = fragmented_page()?;
+    let mut appended = empty_page(512)?;
+    insert(&mut appended, 0, b"hello")?;
+    insert(&mut appended, 1, b"ab")?;
+    compact(&mut with_hole)?;
+    compact(&mut appended)?;
+    ensure!(with_hole == appended, "same cells, different bytes");
+    Ok(())
+}
+
+#[test]
+fn compact_twice_equals_compact_once() -> anyhow::Result<()> {
+    let mut buf = fragmented_page()?;
+    compact(&mut buf)?;
+    let once = buf.clone();
+    compact(&mut buf)?;
+    ensure!(buf == once, "a second compact changed the page");
+    Ok(())
+}
+
+#[test]
+fn compact_page_with_only_dead_cells_resets_free_end() -> anyhow::Result<()> {
+    let mut buf = empty_page(512)?;
+    insert(&mut buf, 0, b"hello")?;
+    remove(&mut buf, 0)?;
+    compact(&mut buf)?;
+    check_compacted(&buf)?;
+    ensure!(
+        slice(&buf, 16, 4)? == [0, 0, 0, 0],
+        "cell_count or fragmented"
+    );
+    ensure!(slice(&buf, 20, 4)? == [0x00, 0x02, 0x00, 0x00], "free_end");
+
+    for size in SIZES {
+        // The largest cell, so free_end goes from 36 back to the page size,
+        // which needs the full u32 at 64 KiB.
+        let mut buf = empty_page(size)?;
+        insert(&mut buf, 0, &vec![9; sub(size, 36)?])?;
+        remove(&mut buf, 0)?;
+        compact(&mut buf)?;
+        check_compacted(&buf)?;
+        ensure!(free_end_of(&buf)? == size, "size {size}: free_end");
+        ensure!(
+            slice(&buf, 32, sub(size, 32)?)?.iter().all(|&b| b == 0),
+            "size {size}: body not zero"
+        );
+        let page = SlottedPage::new(&buf)?;
+        ensure!(page.cell_count() == 0, "size {size}: cell_count");
+        ensure!(
+            page.contiguous_free() == sub(size, 32)?,
+            "size {size}: contiguous_free"
+        );
+    }
+    let buf = {
+        let mut buf = empty_page(65536)?;
+        insert(&mut buf, 0, &vec![9; 65500])?;
+        remove(&mut buf, 0)?;
+        compact(&mut buf)?;
+        buf
+    };
+    ensure!(
+        slice(&buf, 20, 4)? == [0x00, 0x00, 0x01, 0x00],
+        "64 KiB free_end bytes"
+    );
+    Ok(())
+}
+
+#[test]
+fn compact_does_not_touch_checksum_common_header_or_flags() -> anyhow::Result<()> {
+    let mut buf = fragmented_page()?;
+    put(&mut buf, 0, &[1, 2, 3, 4])?;
+    put(&mut buf, 5, &[0x11; 11])?;
+    put(
+        &mut buf,
+        24,
+        &[0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87],
+    )?;
+    let before = protected_bytes(&buf)?;
+    compact(&mut buf)?;
+    ensure!(protected_bytes(&buf)? == before, "protected bytes changed");
+    ensure!(buf.get(4) == Some(&3), "type byte lost");
+    check_compacted(&buf)
+}
+
+#[test]
+fn insert_compacts_when_only_fragmented_space_is_free() -> anyhow::Result<()> {
+    // Before step 9 this insert failed with PageFull { needed: 5,
+    // contiguous: 4, total_free: 480 }.
     let mut buf = empty_page(512)?;
     insert(&mut buf, 0, &[0x33; 476])?;
     remove(&mut buf, 0)?;
+    insert(&mut buf, 0, &[0x44])?;
+    check_no_holes(&buf)?;
+    ensure!(buf.get(511) == Some(&0x44), "cell byte at 511");
+    // slot 0 = [offset 511 = 0x01FF, len 1]
+    ensure!(slice(&buf, 32, 4)? == [0xFF, 0x01, 0x01, 0x00], "slot 0");
+    ensure!(slice(&buf, 20, 4)? == [0xFF, 0x01, 0x00, 0x00], "free_end");
+    ensure!(
+        slice(&buf, 36, 475)?.iter().all(|&b| b == 0),
+        "[36, 511) not zeroed"
+    );
+    Ok(())
+}
+
+#[test]
+fn insert_that_fits_contiguous_space_does_not_compact() -> anyhow::Result<()> {
+    // contiguous_free is 65, so a 61-byte cell (65 with its slot) fits exactly.
+    let mut buf = fragmented_page()?;
+    insert(&mut buf, 1, &[0x77; 61])?;
+    check_invariants(&buf)?;
+    check_free_gap_zeroed(&buf)?;
+    ensure!(fragmented_of(&buf)? == 400, "fragmented_bytes changed");
+    ensure!(slice(&buf, 32, 4)? == [0xFB, 0x01, 0x05, 0x00], "slot 0");
+    // slot 1 = [44, 61], slot 2 = [105, 2]: ab did not move.
+    ensure!(slice(&buf, 36, 4)? == [0x2C, 0x00, 0x3D, 0x00], "slot 1");
+    ensure!(slice(&buf, 40, 4)? == [0x69, 0x00, 0x02, 0x00], "slot 2");
+    ensure!(slice(&buf, 105, 2)? == *b"ab", "ab moved");
+    ensure!(free_end_of(&buf)? == 44, "free_end");
+    let page = SlottedPage::new(&buf)?;
+    ensure!(page.contiguous_free() == 0, "contiguous_free");
+    ensure!(page.total_free() == 400, "total_free");
+    Ok(())
+}
+
+#[test]
+fn insert_one_byte_past_contiguous_space_compacts() -> anyhow::Result<()> {
+    // A 62-byte cell needs 66 > 65 contiguous bytes, so insert compacts first:
+    // hello goes to 505..510 and ab to 510..512. Then the new cell goes to
+    // free_end like any insert (443..505), even though it is logical cell 1.
+    let mut buf = fragmented_page()?;
+    insert(&mut buf, 1, &[0x77; 62])?;
+    check_no_holes(&buf)?;
+    ensure!(slice(&buf, 32, 4)? == [0xF9, 0x01, 0x05, 0x00], "slot 0");
+    // slot 1 = [443 = 0x01BB, 62]
+    ensure!(slice(&buf, 36, 4)? == [0xBB, 0x01, 0x3E, 0x00], "slot 1");
+    // slot 2 = [510 = 0x01FE, 2]
+    ensure!(slice(&buf, 40, 4)? == [0xFE, 0x01, 0x02, 0x00], "slot 2");
+    ensure!(slice(&buf, 20, 4)? == [0xBB, 0x01, 0x00, 0x00], "free_end");
+    let expected = vec![b"hello".to_vec(), vec![0x77; 62], b"ab".to_vec()];
+    ensure!(cells_of(&buf)? == expected, "cells");
+    Ok(())
+}
+
+#[test]
+fn insert_uses_all_free_space_and_then_fails() -> anyhow::Result<()> {
+    // total_free is 465: a 461-byte cell (465 with its slot) fits exactly.
+    let mut buf = fragmented_page()?;
+    insert(&mut buf, 2, &[0x55; 461])?;
+    check_no_holes(&buf)?;
+    // slot 2 = [44, 461 = 0x01CD]
+    ensure!(slice(&buf, 40, 4)? == [0x2C, 0x00, 0xCD, 0x01], "slot 2");
+    let page = SlottedPage::new(&buf)?;
+    ensure!(
+        page.free_start() == 44 && page.free_end() == 44,
+        "free_start/free_end"
+    );
+    ensure!(page.total_free() == 0, "total_free");
+
+    // One byte more does not fit even after compaction. The page is not
+    // compacted on the way to the error.
+    let mut buf = fragmented_page()?;
     let before = buf.clone();
-    let error = insert(&mut buf, 0, &[0x44]).err();
+    let error = insert(&mut buf, 2, &[0x55; 462]).err();
     ensure!(
         error
             == Some(PageError::PageFull {
-                needed: 5,
-                contiguous: 4,
-                total_free: 480
+                needed: 466,
+                contiguous: 65,
+                total_free: 465
             }),
         "got {error:?}"
     );
     ensure!(buf == before, "the failed insert changed the buffer");
+    Ok(())
+}
+
+#[test]
+fn compact_on_corrupt_page_fails_without_writing() -> anyhow::Result<()> {
+    let valid = fragmented_page()?;
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    // Slot 1 points into hello. Every slot is in range and the sum matches
+    // (5 + 2 + 400 = 407), so only the overlap check can catch it.
+    let mut buf = valid.clone();
+    put_slot(&mut buf, 1, 507, 2)?;
+    cases.push(("overlapping cells".into(), buf));
+    // fragmented_bytes off by one: the header check passes (it is below the
+    // cell area of 407), but the sum does not match.
+    for fragmented in [399u16, 401] {
+        let mut buf = valid.clone();
+        put_u16(&mut buf, OFF_FRAGMENTED, fragmented)?;
+        cases.push((format!("fragmented {fragmented}"), buf));
+    }
+
+    for (what, buf) in &cases {
+        mut_view_rejects(buf, &format!("{what}: compact"), compact_view)?;
+        // 104 bytes needed > 65 contiguous, so this insert must compact.
+        mut_view_rejects(buf, &format!("{what}: insert that compacts"), |p| {
+            p.insert(0, &[1; 100])
+        })?;
+    }
     Ok(())
 }
 
@@ -970,6 +1342,7 @@ fn header_corruption_is_rejected(buf: &[u8], what: &str) -> anyhow::Result<()> {
     );
     mut_view_rejects(buf, &format!("{what}: insert"), |p| p.insert(0, b"x"))?;
     mut_view_rejects(buf, &format!("{what}: remove"), |p| p.remove(0))?;
+    mut_view_rejects(buf, &format!("{what}: compact"), compact_view)?;
     Ok(())
 }
 
@@ -1020,6 +1393,8 @@ fn bad_slot_zero_is_rejected(buf: &[u8], what: &str) -> anyhow::Result<()> {
         p.view().validate()
     })?;
     mut_view_rejects(buf, &format!("{what}: remove(0)"), |p| p.remove(0))?;
+    // compact validates the whole page first, even when fragmented_bytes is 0.
+    mut_view_rejects(buf, &format!("{what}: compact"), compact_view)?;
 
     // insert may not look at the slots, so it is allowed to succeed on a page
     // with a bad slot, but it must not panic and a failure must not write.
@@ -1107,6 +1482,7 @@ fn mutations_on_corrupt_page_fail_without_writing() -> anyhow::Result<()> {
 
     for (what, buf) in &cases {
         mut_view_rejects(buf, &format!("{what}: remove(0)"), |p| p.remove(0))?;
+        mut_view_rejects(buf, &format!("{what}: compact"), compact_view)?;
     }
     // insert at the end must also fail without writing when the header is bad.
     for (what, buf) in cases.iter().take(3) {
@@ -1160,6 +1536,106 @@ fn exercise(original: &[u8]) -> Result<(), TestCaseError> {
         let _ = page.insert(count, b"q");
         let _ = page.remove(count);
         let _ = page.view().validate();
+        // compact validates first, and compaction keeps a valid page valid.
+        if page.compact().is_ok() {
+            prop_assert!(
+                page.view().validate().is_ok(),
+                "compact succeeded but left an invalid page"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One random operation for `run_ops_against_model`.
+#[derive(Debug, Clone)]
+enum Op {
+    Insert(Index, Vec<u8>),
+    Remove(Index),
+    Compact,
+}
+
+fn op_strategy() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        3 => (any::<Index>(), prop::collection::vec(any::<u8>(), 1..=120))
+            .prop_map(|(index, cell)| Op::Insert(index, cell)),
+        2 => any::<Index>().prop_map(Op::Remove),
+        1 => Just(Op::Compact),
+    ]
+}
+
+/// Total free bytes of a 512-byte page holding `model`, computed from the
+/// model: 480 bytes of room minus one slot and the bytes of each cell.
+fn model_total_free(model: &[Vec<u8>]) -> anyhow::Result<usize> {
+    let live = model
+        .iter()
+        .try_fold(0usize, |acc, cell| acc.checked_add(cell.len()))
+        .context("live bytes overflow")?;
+    sub(480, add(mul(4, model.len())?, live)?)
+}
+
+/// Applies `ops` to a 512-byte page and to a `Vec` model. An insert must
+/// succeed exactly when the model says the cell fits in the total free space,
+/// and it must compact exactly when the cell does not fit in the contiguous
+/// space. A failed insert is `PageFull` and writes nothing.
+fn run_ops_against_model(ops: Vec<Op>) -> anyhow::Result<()> {
+    let mut buf = empty_page(512)?;
+    let mut model: Vec<Vec<u8>> = Vec::new();
+    for op in ops {
+        match op {
+            Op::Insert(selector, cell) => {
+                let index = selector.index(add(model.len(), 1)?);
+                let needed = add(cell.len(), 4)?;
+                let total_free = model_total_free(&model)?;
+                let contiguous = sub(free_end_of(&buf)?, free_start_of(&buf)?)?;
+                let fragmented = fragmented_of(&buf)?;
+                if needed <= total_free {
+                    insert(&mut buf, index, &cell)
+                        .with_context(|| format!("insert {needed} bytes at {index}"))?;
+                    model.insert(index, cell);
+                    let after = fragmented_of(&buf)?;
+                    if needed <= contiguous {
+                        ensure!(after == fragmented, "insert compacted without need");
+                    } else {
+                        ensure!(after == 0, "insert did not compact");
+                    }
+                } else {
+                    let before = buf.clone();
+                    let error = insert(&mut buf, index, &cell).err();
+                    ensure!(
+                        error
+                            == Some(PageError::PageFull {
+                                needed,
+                                contiguous,
+                                total_free
+                            }),
+                        "insert {needed} bytes: got {error:?}"
+                    );
+                    ensure!(buf == before, "a failed insert changed the buffer");
+                }
+            }
+            Op::Remove(selector) => {
+                if model.is_empty() {
+                    continue;
+                }
+                let index = selector.index(model.len());
+                remove(&mut buf, index).with_context(|| format!("remove {index}"))?;
+                model.remove(index);
+            }
+            Op::Compact => {
+                compact(&mut buf).context("compact")?;
+                check_compacted(&buf)?;
+            }
+        }
+        check_invariants(&buf)?;
+        check_free_gap_zeroed(&buf)?;
+        ensure!(cells_of(&buf)? == model, "cells differ from the model");
+        let page = SlottedPage::new(&buf)?;
+        ensure!(
+            page.total_free() == model_total_free(&model)?,
+            "total_free {} differs from the model",
+            page.total_free()
+        );
     }
     Ok(())
 }
@@ -1213,5 +1689,12 @@ proptest! {
         let page = SlottedPage::new(&buf)
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
         prop_assert!(page.validate().is_ok());
+    }
+
+    #[test]
+    fn prop_insert_remove_compact_match_model(
+        ops in prop::collection::vec(op_strategy(), 1..=80)
+    ) {
+        run_ops_against_model(ops).map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
     }
 }

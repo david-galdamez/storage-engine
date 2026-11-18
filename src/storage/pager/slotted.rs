@@ -10,6 +10,8 @@
 //!   search works directly on them.
 //! - The cell area at the end of the page. Cells grow backward from the end of
 //!   the page, and the free space sits between the slot directory and the cells.
+//!   Removed cells leave holes, counted in `fragmented_bytes`, until
+//!   [`SlottedPageMut::compact`] rewrites the cells without them.
 //!
 //! The module exposes two borrowed views over the page buffer:
 //!
@@ -344,22 +346,25 @@ impl<'a> SlottedPageMut<'a> {
     }
 
     /// Inserts `cell` at logical position `index`. The cell bytes go right
-    /// below `free_end` and the slots from `index` on shift one place. A failed
-    /// insert leaves the buffer unchanged. Fragmented space is not reused yet.
+    /// below `free_end` and the slots from `index` on shift one place. If the
+    /// cell only fits once the fragmented bytes are reclaimed, the page is
+    /// compacted first (see [`Self::compact`]). A failed insert leaves the
+    /// buffer unchanged.
     ///
     /// # Errors
     ///
     /// Returns [`PageError::EmptyCell`] for an empty cell,
     /// [`PageError::CellTooLarge`] if it exceeds [`max_cell_len`],
     /// [`PageError::SlotOutOfRange`] if `index` is past the cell count, and
-    /// [`PageError::PageFull`] if there is no room left.
+    /// [`PageError::PageFull`] if the cell does not fit even after compaction.
+    /// Returns [`PageError::CorruptSlottedPage`] if the page needs compaction
+    /// and fails validation.
     pub fn insert(&mut self, index: usize, cell: &[u8]) -> Result<(), PageError> {
         let slotted_page = self.view();
         let cell_count = slotted_page.cell_count();
         let contiguous_free = slotted_page.contiguous_free();
         let total_free = slotted_page.total_free();
         let free_start = slotted_page.free_start();
-        let free_end = slotted_page.free_end();
 
         if cell.is_empty() {
             return Err(PageError::EmptyCell);
@@ -378,13 +383,20 @@ impl<'a> SlottedPageMut<'a> {
         }
 
         let needed = cell.len().saturating_add(SLOT_SIZE);
-        if needed > contiguous_free {
+        if needed > total_free {
             return Err(PageError::PageFull {
                 needed,
                 contiguous: contiguous_free,
                 total_free,
             });
         }
+
+        // The cell fits only with the fragmented bytes: compacting makes all
+        // free space contiguous. It moves free_end, but not free_start.
+        if needed > contiguous_free {
+            self.compact()?;
+        }
+        let free_end = self.view().free_end();
 
         let new_free_end_u32 =
             u32::try_from(free_end.saturating_sub(cell.len())).map_err(|_| {
@@ -491,6 +503,77 @@ impl<'a> SlottedPageMut<'a> {
 
         write_u16(self.page, CELL_COUNT_OFFSET, new_count)?;
         write_u16(self.page, FRAGMENTED_BYTES_OFFSET, new_fragmented)?;
+
+        Ok(())
+    }
+
+    /// Rewrites the live cells in logical order from low to high addresses:
+    /// cell 0 starts at the new `free_end`, each next cell starts where the
+    /// previous one ends, and the last cell ends at the page end. Sets
+    /// `fragmented_bytes` to 0 and zeroes the free space. The slot order and
+    /// the cell contents do not change.
+    ///
+    /// The result depends only on the cells, so a page with no fragmented
+    /// bytes is still reordered. The cells are copied to a scratch `Vec`
+    /// first, because the new place of a cell can overlap a cell that has not
+    /// moved yet (ADR 0004).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageError::CorruptSlottedPage`] if the page fails
+    /// [`SlottedPage::validate`]. The buffer is not modified in that case.
+    pub fn compact(&mut self) -> Result<(), PageError> {
+        let slotted_page = self.view();
+        slotted_page.validate()?;
+        let cell_count = slotted_page.cell_count();
+        let free_start = slotted_page.free_start();
+        let page_len = self.page.len();
+        // validate checked I4, so the live bytes are the cell area minus the
+        // fragmented bytes.
+        let live = page_len
+            .saturating_sub(slotted_page.free_end())
+            .saturating_sub(slotted_page.fragmented_bytes());
+
+        // Step 1: copy the live cells out of the page, in logical order.
+        let mut scratch = Vec::with_capacity(live);
+        for index in 0..cell_count {
+            scratch.extend_from_slice(slotted_page.cell(index)?);
+        }
+
+        let new_free_end = page_len.saturating_sub(scratch.len());
+        let new_free_end_u32 =
+            u32::try_from(new_free_end).map_err(|_| PageError::CorruptSlottedPage {
+                reason: "new free_end does not fit in u32",
+            })?;
+
+        // Step 2: zero the new free space, which includes the old copies of
+        // the cells that sat below the new free_end.
+        self.page
+            .get_mut(free_start..new_free_end)
+            .ok_or(PageError::CorruptSlottedPage {
+                reason: "free space range out of the page",
+            })?
+            .fill(0);
+
+        // Step 3: write the cells back, packed against the page end.
+        write_bytes(self.page, new_free_end, &scratch)?;
+
+        // Step 4: point each slot at the new place of its cell. Lengths do not
+        // change. Every offset is below the page length, at most 65536, so it
+        // fits in a u16.
+        let mut offset = new_free_end;
+        for index in 0..cell_count {
+            let slot_pos = (index.saturating_mul(SLOT_SIZE)).saturating_add(SLOTTED_HEADER_SIZE);
+            let len = read_u16(self.page, slot_pos.saturating_add(SLOT_LEN_OFFSET))?;
+            let offset_u16 = u16::try_from(offset).map_err(|_| PageError::CorruptSlottedPage {
+                reason: "cell offset does not fit in u16",
+            })?;
+            write_u16(self.page, slot_pos, offset_u16)?;
+            offset = offset.saturating_add(usize::from(len));
+        }
+
+        write_u16(self.page, FRAGMENTED_BYTES_OFFSET, 0)?;
+        write_u32(self.page, FREE_END_OFFSET, new_free_end_u32)?;
 
         Ok(())
     }
