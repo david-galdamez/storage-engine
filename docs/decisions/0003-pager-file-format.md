@@ -160,12 +160,21 @@ Slotted page invariants:
 4. `page_size - free_end == sum(len) + fragmented_bytes`.
 5. Maximum cell length is `page_size - 36` (32-byte header plus one 4-byte slot).
    An insert needs `len + 4` bytes. If the contiguous free space is not enough
-   but contiguous plus fragmented space is, the page is compacted first.
-   Otherwise the insert fails with a "page full" error.
-6. After compaction, `fragmented_bytes == 0`, cells are contiguous, and logical
-   order and contents are unchanged.
+   but contiguous plus fragmented space is, the page is compacted first, and
+   then the new cell goes at `free_end` like any insert. Otherwise the insert
+   fails with a "page full" error and the page is not changed.
+6. Compaction rewrites the live cells in logical order from low to high
+   addresses: cell 0 starts at the new `free_end`, each next cell starts where
+   the previous one ends, and the last cell ends at `page_size`. After it,
+   `fragmented_bytes == 0` and the slot order and cell contents are unchanged.
+   The result depends only on the cells, so compaction also reorders a page
+   with no fragmented bytes. It validates the whole page first and writes
+   nothing on a corrupt page. ADR 0004 covers the scratch buffer it uses.
 7. Removing a cell zeroes its dead bytes and the freed slot entry, and deletes
    never move `free_end`: only compaction reclaims the space.
+8. The free space `[free_start, free_end)` is always all zeros. `init` zeroes
+   it, `remove` zeroes the slot it frees, and compaction zeroes the bytes it
+   vacates.
 
 Pager behavior:
 
