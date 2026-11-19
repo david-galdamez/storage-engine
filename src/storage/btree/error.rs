@@ -50,4 +50,18 @@ pub enum BTreeError {
     /// failed.
     #[error("Invalid root, page_id: {page}, reason: {reason}")]
     InvalidRoot { page: PageId, reason: &'static str },
+
+    /// The structure of the tree is wrong, not one node: a child pointer
+    /// leads to a page that is not a B+Tree node, or a descent is deeper than
+    /// any valid tree, for example because of a cycle. Field `page` is the
+    /// page where the problem was found; field `reason` names the rule that
+    /// failed.
+    #[error("Corrupt tree, page_id: {page}, reason: {reason}")]
+    CorruptTree { page: PageId, reason: &'static str },
+
+    /// The operation needs a feature that is not implemented yet. Temporary:
+    /// removed in Phase 2 step 8, when overflow chains exist. Field `what`
+    /// names the missing feature.
+    #[error("Unsupported: {what}")]
+    Unsupported { what: &'static str },
 }

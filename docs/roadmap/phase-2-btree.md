@@ -48,7 +48,7 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 1   | File header v2                | Add `catalog_root`, bump the format version                                            | Ch. 3 Versioning                                               | Done    |
 | 2   | Node views                    | Read and write views for leaf and internal nodes; search a key inside a node          | Ch. 4 Binary Search                                            | Done    |
 | 3   | Engine trait and tree handle  | Draft `StorageEngine` trait (implemented after step 10); `BTree::create` and `BTree::open` by root page id | —                                                  | Done    |
-| 4   | Lookup                        | `get`: descend from the root to a leaf                                                 | Ch. 2 B-Tree Lookup Algorithm                                  | Planned |
+| 4   | Lookup                        | `get`: descend from the root to a leaf                                                 | Ch. 2 B-Tree Lookup Algorithm                                  | Done    |
 | 5   | Insert without splits         | `put` into a root leaf, with upsert                                                    | Ch. 2 Node Splits                                              | Planned |
 | 6   | Leaf split                    | Split a full leaf, with right-only appends; keep the root page id stable              | Ch. 2 Node Splits; Ch. 4 Propagating Splits and Merges         | Planned |
 | 7   | Internal split                | Split internal nodes and propagate through breadcrumbs, any height                    | Ch. 4 Breadcrumbs                                              | Planned |
