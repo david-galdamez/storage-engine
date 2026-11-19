@@ -196,6 +196,7 @@ ADRs are required for: owned data instead of references (5.1), any `unsafe`
 | Pager file format | Common page header, file header on page 0, slotted pages with positional slots (ADR 0003) |
 | Free pages | LIFO linked free list through the free pages (ADR 0003) |
 | Compaction | Live cells copied to a scratch buffer, then rewritten in logical order (ADR 0004) |
+| B+Tree node format | Leaf/internal/overflow page types over the slotted layout, stable root page id, right leaf links only, whole values in overflow chains, file header v2 with `catalog_root` (ADR 0005) |
 
 ## 10. Open decisions
 

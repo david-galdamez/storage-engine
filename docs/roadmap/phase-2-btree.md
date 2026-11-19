@@ -25,8 +25,9 @@ merges, breadcrumbs, rebalancing, vacuum).
   overflow pages.
 - The root page id of a tree never changes, so the catalog can reference it.
   A root split moves the old root's contents to a new page.
-- Leaves are linked in both directions, so a cursor can scan forward and
-  backward.
+- Leaves are linked to their right neighbor only. Forward scans follow the
+  link; reverse scans use the cursor's path from the root (ADR 0005).
+- Sequential inserts use right-only appends, so leaves fill completely.
 - Range scans support inclusive, exclusive and unbounded ends.
 - Split propagation uses a stack of breadcrumbs (the page ids on the path from
   the root), not recursion.
@@ -43,16 +44,16 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 
 | #   | Step                          | Goal                                                                                   | Reading (_Database Internals_)                                 | Status  |
 | --- | ----------------------------- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ------- |
-| 0   | Node format ADR               | ADR 0005: leaf and internal nodes, overflow pages, sibling links, file header v2      | Ch. 4 Page Header, Sibling Links, Rightmost Pointers, Overflow Pages | Planned |
+| 0   | Node format ADR               | ADR 0005: leaf and internal nodes, overflow pages, right links, file header v2        | Ch. 4 Page Header, Sibling Links, Rightmost Pointers, Overflow Pages | Planned |
 | 1   | File header v2                | Add `catalog_root`, bump the format version                                            | Ch. 3 Versioning                                               | Planned |
 | 2   | Node views                    | Read and write views for leaf and internal nodes; search a key inside a node          | Ch. 4 Binary Search                                            | Planned |
 | 3   | Engine trait and tree handle  | Draft `StorageEngine` trait; `BTree::create` and `BTree::open` by root page id        | —                                                              | Planned |
 | 4   | Lookup                        | `get`: descend from the root to a leaf                                                 | Ch. 2 B-Tree Lookup Algorithm                                  | Planned |
 | 5   | Insert without splits         | `put` into a root leaf, with upsert                                                    | Ch. 2 Node Splits                                              | Planned |
-| 6   | Leaf split                    | Split a full leaf; keep the root page id stable                                        | Ch. 2 Node Splits; Ch. 4 Propagating Splits and Merges         | Planned |
+| 6   | Leaf split                    | Split a full leaf, with right-only appends; keep the root page id stable              | Ch. 2 Node Splits; Ch. 4 Propagating Splits and Merges         | Planned |
 | 7   | Internal split                | Split internal nodes and propagate through breadcrumbs, any height                    | Ch. 4 Breadcrumbs                                              | Planned |
 | 8   | Overflow pages                | Store values larger than the inline limit in a chain of overflow pages                | Ch. 4 Overflow Pages                                           | Planned |
-| 9   | Range cursor                  | Forward and reverse scans with inclusive, exclusive and unbounded ends                | Ch. 4 Sibling Links                                            | Planned |
+| 9   | Range cursor                  | Forward and reverse scans with inclusive, exclusive and unbounded ends                | Ch. 4 Sibling Links, Breadcrumbs                               | Planned |
 | 10  | Delete                        | Remove a key and free its overflow pages, without rebalancing                          | —                                                              | Planned |
 | 11  | Rebalancing                   | Merge and redistribute underfull nodes, collapse the root, free empty pages           | Ch. 2 Node Merges; Ch. 4 Rebalancing                           | Planned |
 | 12  | Verification and model tests  | `verify_tree` invariants; property tests against a `BTreeMap` model, many trees per file | —                                                            | Planned |
