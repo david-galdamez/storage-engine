@@ -105,6 +105,7 @@ impl Model {
             page_count: self.page_count,
             freelist_head: self.free.last().map(|&id| PageId::new(id)),
             freelist_count: u32::try_from(self.free.len())?,
+            catalog_root: None,
         })
     }
 
