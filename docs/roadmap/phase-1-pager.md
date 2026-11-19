@@ -39,9 +39,9 @@ amend the ADR if your design is better.
 | 7   | Free list                  | Reuse freed pages instead of always growing the file                                 | Ch. 4 Vacuum and Maintenance; SQLite file format, "The Freelist"                                             | Done   |
 | 8   | Slotted page               | Store, read, and remove variable-size cells in a page, in order                      | Ch. 3 Slotted Pages, Cell Layout, Managing Variable-Size Data; Ch. 4 Binary Search with Indirection Pointers | Done   |
 | 9   | Compaction                 | Reclaim space left by deleted cells                                                  | Ch. 4 Fragmentation, Page Defragmentation                                                                    | Done   |
-| 10  | Property tests             | Random operations checked against a simple model                                     | —                                                                                                            | Next   |
-| 11  | Demo example               | Create a sample file to inspect with `xxd`                                           | —                                                                                                            |        |
-| 12  | Docs                       | Update README roadmap and ADRs                                                       | —                                                                                                            |        |
+| 10  | Property tests             | Random operations checked against a simple model: [model test](../../tests/pager_model.rs), [slotted test](../../tests/pager_slotted.rs) | — | Done |
+| 11  | Demo example               | Create a sample file to inspect with `xxd`: [example](../../examples/pager_demo.rs), [guide](../guides/inspect-pager-file.md) | — | Done |
+| 12  | Docs                       | Update README roadmap and ADRs | — | Done |
 
 Steps 2–9 are written by the owner. Steps 10 and 11 are supporting code
 written by Claude. Step 12 is documentation.

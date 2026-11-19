@@ -8,8 +8,9 @@ full document database: MongoDB-style JSON-like documents, collections with
 validation, secondary indexes, ACID transactions, a binary TCP protocol, and
 eventually vector tables for similarity search.
 
-> **Status:** early development (Phase 0). Nothing here is production-ready.
-> The project has no final name yet.
+> **Status:** Phase 0 (in-memory store and REPL) and Phase 1 (pager) are done.
+> Phase 2 (B+Tree) is next. Nothing here is production-ready. The project has
+> no final name yet.
 
 ---
 
@@ -89,9 +90,9 @@ implementations (for example an LSM-Tree) can be tried later.
 
 | Phase | Milestone                                                                 | Status      |
 |-------|---------------------------------------------------------------------------|-------------|
-| 0     | In-memory key-value store + REPL to test it                               | In progress |
-| 1     | Pager: on-disk file, fixed-size pages, slotted page layout                | Planned     |
-| 2     | B+Tree key-value storage engine behind a `StorageEngine` trait            | Planned     |
+| 0     | In-memory key-value store + REPL to test it                               | Done        |
+| 1     | Pager: on-disk file, fixed-size pages, slotted page layout                | Done        |
+| 2     | B+Tree key-value storage engine behind a `StorageEngine` trait            | Next        |
 | 3     | Write-ahead log (WAL) and crash recovery                                  | Planned     |
 | 4     | Buffer pool / page cache                                                  | Planned     |
 | 5     | Binary document format with in-place field access, UUID `_id`             | Planned     |
@@ -125,6 +126,22 @@ $ exit
 The REPL exists only to check that data is stored correctly. It will be
 replaced by two binaries: a **server** and a **client**.
 
+### Inspect a database file
+
+The `pager_demo` example writes a small database file with a free page, a
+slotted page with a hole, and a compacted page. Then dump its bytes:
+
+```bash
+cargo run --example pager_demo -- --force
+xxd -a target/pager-demo.db
+```
+
+The default page size is 512 bytes. Add `--page-size 4096` to write the file
+with the engine's default page size (ADR 0001). `--force` deletes the file first
+if it already exists. The guide
+[Inspecting a pager file with `xxd`](docs/guides/inspect-pager-file.md) explains
+every byte of the file.
+
 ## Development
 
 ```bash
@@ -133,8 +150,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-All three must pass before every commit, and CI runs them on every push.
-See [AGENTS.md](AGENTS.md) for the development workflow and coding rules.
+All three must pass before every commit. The
+[CI workflow](.github/workflows/ci.yml) runs the same three commands on every
+push and on every pull request. See [AGENTS.md](AGENTS.md) for the development
+workflow and coding rules.
 
 ## References
 

@@ -193,6 +193,9 @@ ADRs are required for: owned data instead of references (5.1), any `unsafe`
 | Binaries              | Separate server and client (the REPL is temporary)    |
 | Vectors               | Dedicated vector tables (future)                      |
 | Page size             | 4 KiB default, stored in file header (ADR 0001)       |
+| Pager file format | Common page header, file header on page 0, slotted pages with positional slots (ADR 0003) |
+| Free pages | LIFO linked free list through the free pages (ADR 0003) |
+| Compaction | Live cells copied to a scratch buffer, then rewritten in logical order (ADR 0004) |
 
 ## 10. Open decisions
 
