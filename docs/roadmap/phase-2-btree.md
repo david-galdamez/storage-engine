@@ -44,9 +44,9 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 
 | #   | Step                          | Goal                                                                                   | Reading (_Database Internals_)                                 | Status  |
 | --- | ----------------------------- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ------- |
-| 0   | Node format ADR               | ADR 0005: leaf and internal nodes, overflow pages, right links, file header v2        | Ch. 4 Page Header, Sibling Links, Rightmost Pointers, Overflow Pages | Planned |
-| 1   | File header v2                | Add `catalog_root`, bump the format version                                            | Ch. 3 Versioning                                               | Planned |
-| 2   | Node views                    | Read and write views for leaf and internal nodes; search a key inside a node          | Ch. 4 Binary Search                                            | Planned |
+| 0   | Node format ADR               | ADR 0005: leaf and internal nodes, overflow pages, right links, file header v2        | Ch. 4 Page Header, Sibling Links, Rightmost Pointers, Overflow Pages | Done    |
+| 1   | File header v2                | Add `catalog_root`, bump the format version                                            | Ch. 3 Versioning                                               | Done    |
+| 2   | Node views                    | Read and write views for leaf and internal nodes; search a key inside a node          | Ch. 4 Binary Search                                            | Done    |
 | 3   | Engine trait and tree handle  | Draft `StorageEngine` trait; `BTree::create` and `BTree::open` by root page id        | —                                                              | Planned |
 | 4   | Lookup                        | `get`: descend from the root to a leaf                                                 | Ch. 2 B-Tree Lookup Algorithm                                  | Planned |
 | 5   | Insert without splits         | `put` into a root leaf, with upsert                                                    | Ch. 2 Node Splits                                              | Planned |
