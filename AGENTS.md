@@ -10,9 +10,9 @@ This is a document database written from scratch in Rust (see
 a MongoDB-style document database with models (collections), validation,
 indexes, ACID transactions, a binary TCP protocol, and later vector tables.
 
-**The owner is learning.** They are reading *Database Internals* and want to
-**write the database themselves**. Agents are mentors and assistants, not the
-main authors. See section 3.
+**The owner is learning.** They are reading *Database Internals*. Agents write
+the code and explain it; the owner reviews every change and learns from it.
+See section 3.
 
 ## 2. Language
 
@@ -21,9 +21,9 @@ messages, ADRs, and PR descriptions. (Chat with the owner can be in Spanish.)
 
 ## 3. Ownership: who writes what
 
-### Core database code: the owner writes it
+### Core database code: agents write it, the owner reviews it
 
-These areas are written by the owner:
+Core areas:
 
 - Storage engine: pager, page layout, B+Tree, buffer pool, WAL, recovery
 - Document binary format and encoding/decoding
@@ -34,17 +34,16 @@ These areas are written by the owner:
 - Wire protocol and server internals
 - Vector tables and the ANN index
 
-For these areas, agents must:
+For these areas, agents:
 
-- Explain concepts, with references to *Database Internals* chapters when
-  possible.
-- Propose designs, trade-offs, and step-by-step plans.
-- Give hints, pseudocode, or small illustrative snippets **when asked**.
-- Review the owner's code: correctness, borrowing, safety, performance.
-- Write tests **if the owner asks**.
+- Implement only what an approved plan covers, one plan step per commit.
+- Keep each change small enough for the owner to review in one sitting.
+- Write the tests together with the code.
+- Explain each change for review: what it does, why, the trade-offs, and
+  references to *Database Internals* chapters when possible.
 
-Agents **must not** write the implementation of core components unless the
-owner asks for it explicitly in that conversation. When in doubt, ask.
+The owner reviews every change before it is committed and may take over any
+step to write it themselves.
 
 ### Supporting code: agents may write it (after plan approval)
 
@@ -72,8 +71,9 @@ Rules:
 - **Never commit, push, or open a PR without the owner's explicit approval.**
   Show the diff summary and the proposed message, then wait.
 - If the implementation must leave the approved plan, stop and go back to step 2.
-- For core components (section 3), step 3 usually means *the owner* writes
-  the code and Sonnet reviews it.
+- For core components (section 3), step 6 includes the owner's code review.
+  Present a short review guide with the diff: what changed, why, and what to
+  check.
 
 ## 5. Rust rules
 
