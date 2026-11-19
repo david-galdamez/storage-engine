@@ -9,7 +9,9 @@ Out of scope: page cache (Phase 4), WAL and crash recovery (Phase 3), B+Tree
 
 Related decisions: [ADR 0001](../decisions/0001-page-size.md) (page size),
 [ADR 0002](../decisions/0002-test-dev-dependencies.md) (test dependencies),
-[ADR 0003](../decisions/0003-pager-file-format.md) (file format). For steps
+[ADR 0003](../decisions/0003-pager-file-format.md) (file format),
+[ADR 0004](../decisions/0004-compaction-scratch-buffer.md) (compaction
+scratch buffer). For steps
 4–8, design each layout yourself first, then compare it with ADR 0003 and
 amend the ADR if your design is better.
 
@@ -35,11 +37,11 @@ amend the ADR if your design is better.
 | 5   | File header                | Page 0: identify the file and describe the database                                  | Ch. 4 Magic Numbers; Ch. 3 Versioning                                                                        | Done   |
 | 6   | Pager with page I/O        | Create and open a database file, read and write pages, grow the file                 | Ch. 3 General Principles; Ch. 4 Page Header                                                                  | Done   |
 | 7   | Free list                  | Reuse freed pages instead of always growing the file                                 | Ch. 4 Vacuum and Maintenance; SQLite file format, "The Freelist"                                             | Done   |
-| 8   | Slotted page               | Store, read, and remove variable-size cells in a page, in order                      | Ch. 3 Slotted Pages, Cell Layout, Managing Variable-Size Data; Ch. 4 Binary Search with Indirection Pointers | Next   |
-| 9   | Compaction                 | Reclaim space left by deleted cells                                                  | Ch. 4 Fragmentation, Page Defragmentation                                                                    |        |
-| 10  | Property tests             | Random operations checked against a simple model                                     | —                                                                                                            |        |
-| 11  | Demo example               | Create a sample file to inspect with `xxd`                                           | —                                                                                                            |        |
-| 12  | Docs                       | Update README roadmap and ADRs                                                       | —                                                                                                            |        |
+| 8   | Slotted page               | Store, read, and remove variable-size cells in a page, in order                      | Ch. 3 Slotted Pages, Cell Layout, Managing Variable-Size Data; Ch. 4 Binary Search with Indirection Pointers | Done   |
+| 9   | Compaction                 | Reclaim space left by deleted cells                                                  | Ch. 4 Fragmentation, Page Defragmentation                                                                    | Done   |
+| 10  | Property tests             | Random operations checked against a simple model: [model test](../../tests/pager_model.rs), [slotted test](../../tests/pager_slotted.rs) | — | Done |
+| 11  | Demo example               | Create a sample file to inspect with `xxd`: [example](../../examples/pager_demo.rs), [guide](../guides/inspect-pager-file.md) | — | Done |
+| 12  | Docs                       | Update README roadmap and ADRs | — | Done |
 
 Steps 2–9 are written by the owner. Steps 10 and 11 are supporting code
 written by Claude. Step 12 is documentation.

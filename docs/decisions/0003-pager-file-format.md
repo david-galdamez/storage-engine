@@ -160,10 +160,21 @@ Slotted page invariants:
 4. `page_size - free_end == sum(len) + fragmented_bytes`.
 5. Maximum cell length is `page_size - 36` (32-byte header plus one 4-byte slot).
    An insert needs `len + 4` bytes. If the contiguous free space is not enough
-   but contiguous plus fragmented space is, the page is compacted first.
-   Otherwise the insert fails with a "page full" error.
-6. After compaction, `fragmented_bytes == 0`, cells are contiguous, and logical
-   order and contents are unchanged.
+   but contiguous plus fragmented space is, the page is compacted first, and
+   then the new cell goes at `free_end` like any insert. Otherwise the insert
+   fails with a "page full" error and the page is not changed.
+6. Compaction rewrites the live cells in logical order from low to high
+   addresses: cell 0 starts at the new `free_end`, each next cell starts where
+   the previous one ends, and the last cell ends at `page_size`. After it,
+   `fragmented_bytes == 0` and the slot order and cell contents are unchanged.
+   The result depends only on the cells, so compaction also reorders a page
+   with no fragmented bytes. It validates the whole page first and writes
+   nothing on a corrupt page. ADR 0004 covers the scratch buffer it uses.
+7. Removing a cell zeroes its dead bytes and the freed slot entry, and deletes
+   never move `free_end`: only compaction reclaims the space.
+8. The free space `[free_start, free_end)` is always all zeros. `init` zeroes
+   it, `remove` zeroes the slot it frees, and compaction zeroes the bytes it
+   vacates.
 
 Pager behavior:
 
@@ -190,3 +201,101 @@ Pager behavior:
   later optimization.
 - Compaction is required, because deletes only increase `fragmented_bytes`.
 - Supersedes nothing. Builds on ADR 0001.
+
+## Amendments (2026-11-18)
+
+The implementation in `src/storage/pager/` and the tests in `tests/pager_*.rs`
+were checked against the text above. The layouts, the status and the format
+version (1) do not change. The items below say where the code is more precise
+than this text, or differs from it.
+
+### a. Reading a page before its first write
+
+The text above says that a page's contents are undefined until its first write,
+and that reading it fails the checksum. That holds only for pages added by
+growing the file: `allocate_page` fills them with zeros, and the checksum check
+fails.
+
+A page popped from the free list still holds the free page written when it was
+freed. It has type Free and a valid checksum, so reading it succeeds, and
+`decode_free_page` returns its `next_free` link. The `allocate_page` doc states
+this, and `tests/pager_model.rs` checks it (the `Reused` state).
+
+### b. Open order
+
+`Pager::open` runs these checks in order and returns the first failure:
+
+1. `FileTooSmall` if the file is shorter than 512 bytes.
+2. `FileHeader::decode` on the first 512 bytes. It checks, in order: magic
+   (`BadMagic`), format version (`UnsupportedVersion`), page size
+   (`InvalidPageSize`), page type (`UnknownPageType` or `UnexpectedPageType`),
+   and then the header fields (`CorruptHeader`: `page_count` is 0, the free list
+   head and count disagree, or the head is past the end of the file). Errors
+   from this step are wrapped in `PagerError::Corrupted` with page 0.
+3. `FileSizeMismatch` if the file length is not `page_count * page_size`.
+4. Page 0 is read in full and its checksum is verified. A failure is
+   `Corrupted` with `ChecksumMismatch`.
+
+The checksum is the last check. Damage to the header bytes therefore usually
+shows up as `BadMagic`, `CorruptHeader` or another header error, not as a
+checksum error. `open` does not walk the free list. `verify_freelist` is a
+separate call.
+
+### c. Free list: allocation checks, verification and double free
+
+- `allocate_page` checks the head before it pops it. It reads the head (the
+  checksum is verified, as on any read) and requires:
+  - the page decodes as a free page, otherwise `FreelistCorrupted`
+    (`"page is not a free_page"`);
+  - `next_free` is below `page_count`;
+  - `next_free` agrees with the new count: it is none exactly when
+    `freelist_count - 1` is 0.
+
+  A failed check returns `FreelistCorrupted` with the head page. The file and
+  the pager are not changed.
+- `Pager::verify_freelist` walks the list from the head, follows at most
+  `freelist_count` links, and checks each page. It is the only check of the
+  whole list.
+- `free_page` does not read the page. Freeing a page twice links it to itself,
+  which makes a cycle. `verify_freelist` reports it as a list longer than
+  `freelist_count`. `tests/pager_freelist.rs`
+  (`verify_detects_a_double_free_without_looping_forever`) covers this.
+- Not covered by a test, found by reading the code: after a double free,
+  `allocate_page` can return the same page once before the list is reported
+  corrupt. The pop checks do not see the cycle, because the head's link points
+  to a free page below `page_count` and the count is still above 0. The next
+  pop then fails with `FreelistCorrupted`. Until someone calls
+  `verify_freelist`, nothing reports the duplicate. A guard in `free_page`
+  (refuse a page that is already free) would prevent it, but that check needs
+  a read of the page, so it is a decision for the owner.
+
+### d. Growing the file: write order
+
+`allocate_page` grows the file with `set_len` first, and then writes the file
+header with the new `page_count`. If the header write fails, the file is one
+page longer than the header says. The in-memory `page_count` does not change, so
+the process can continue, but the next `Pager::open` fails with
+`FileSizeMismatch`. A crash between the two writes has the same effect.
+
+This is a known gap. Revisit it in Phase 3, when the WAL decides the order of
+these writes.
+
+### e. Reserved bytes
+
+The rule is: writers write 0, readers ignore. The reserved fields are:
+
+- common header: bytes 5..8, and the page LSN at 8..16 (0 until the WAL exists);
+- file header: bytes 26..28 and 44..page_size;
+- free page: bytes 20..page_size;
+- slotted page: the flags byte at 24 (reserved for Phase 2) and bytes 25..32.
+
+The encoders (`FileHeader::encode`, `encode_free_page` and `SlottedPageMut::init`)
+write 0 to all of them, and no decoder checks any of them. The checksum covers
+them, because it covers `[4, page_size)`. So a changed reserved byte fails
+verification, but only if the page is not stamped again.
+
+`write_page` does not check the bytes the caller passes, so "writers write 0"
+is a rule for the layout code, not something the pager enforces.
+`tests/pager_disk.rs` (`open_rejects_changed_reserved_byte_in_page_0`) and
+`tests/pager_file_header.rs` (`decode_ignores_checksum_lsn_and_reserved_bytes`)
+cover this.

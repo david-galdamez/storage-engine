@@ -48,6 +48,38 @@ pub enum PageError {
     /// the rule that failed.
     #[error("Corrupt file header: {reason}")]
     CorruptHeader { reason: &'static str },
+
+    /// The slotted page layout is inconsistent (ADR 0003 invariants), for
+    /// example a slot points outside the cell area. Field `reason` names the
+    /// rule that failed.
+    #[error("Corrupt slotted page: {reason}")]
+    CorruptSlottedPage { reason: &'static str },
+
+    /// A cell is longer than the largest cell a page can hold. Field `len` is
+    /// the rejected length; field `max` is the limit for the page size.
+    #[error("Cell too large, len: {len} - max: {max}")]
+    CellTooLarge { len: usize, max: usize },
+
+    /// A cell has zero length. Empty cells are not allowed, because a slot with
+    /// `len == 0` would be indistinguishable from an unused slot.
+    #[error("Cell is empty")]
+    EmptyCell,
+
+    /// A slot index is not below the cell count. Field `index` is the requested
+    /// index; field `cell_count` is the number of cells in the page.
+    #[error("Slot out of range, index: {index} - cell count: {cell_count}")]
+    SlotOutOfRange { index: usize, cell_count: usize },
+
+    /// The page has no contiguous room for a new cell. Field
+    /// `needed` is the bytes required (cell length plus one slot); field
+    /// `contiguous` is the contiguous free space; field `total_free` adds the
+    /// fragmented bytes.
+    #[error("Page is full, needed: {needed} - contiguous: {contiguous} - total free: {total_free}")]
+    PageFull {
+        needed: usize,
+        contiguous: usize,
+        total_free: usize,
+    },
 }
 
 /// Errors from the file-backed pager.
