@@ -9,17 +9,20 @@
 //! argument: `&Pager` for reads and `&mut Pager` for writes. Many trees share
 //! one pager, and the borrow checker keeps writes and reads apart.
 //!
-//! This step has [`BTree::create`], [`BTree::open`] and [`BTree::get`]. Insert,
-//! delete and scans come in later steps (see the Phase 2 roadmap).
+//! This step has [`BTree::create`], [`BTree::open`], [`BTree::get`] and
+//! [`BTree::put`]. `put` does not split nodes yet: it fails with
+//! [`BTreeError::Unsupported`] when the target leaf is full. Delete and scans
+//! come in later steps (see the Phase 2 roadmap).
 
 use crate::storage::btree::{
-    error::BTreeError,
+    error::{BTreeError, NodeError},
     internal::InternalNode,
     leaf::{LeafNode, LeafNodeMut},
-    node::ValueRef,
+    node::{ValueRef, fits_inline, max_key_len},
 };
 use crate::storage::pager::{
     disk::Pager,
+    error::PageError,
     page::{PageType, page_type},
     types::PageId,
 };
@@ -144,6 +147,85 @@ impl BTree {
                 what: "overflow values (Phase 2, step 8)",
             }),
         }
+    }
+
+    /// Inserts `key` with `value`, or replaces the value if `key` exists
+    /// (upsert). Returns `true` if a value was replaced and `false` if the key
+    /// is new.
+    ///
+    /// The descent is the one of [`BTree::get`] and works for a tree of any
+    /// height. The change is made in the leaf's page buffer and the page is
+    /// written once, only after the change succeeded, so a failed `put` does
+    /// not change the file. Does not sync.
+    ///
+    /// # Errors
+    ///
+    /// - [`BTreeError::KeyTooLarge`] if `key` is longer than `max_key_len`.
+    /// - [`BTreeError::Unsupported`] if the value does not fit inline
+    ///   (overflow values, Phase 2 step 8), if the old value is in overflow
+    ///   pages, or if the leaf has no room for the cell (node splits, Phase 2
+    ///   step 6).
+    /// - [`BTreeError::Pager`] if a read or the write fails or a checksum is
+    ///   wrong.
+    /// - [`BTreeError::Node`] if a node on the path does not decode.
+    /// - [`BTreeError::CorruptTree`] if the root or a child is not a B+Tree
+    ///   node, or the descent is deeper than the maximum height.
+    pub fn put(self, pager: &mut Pager, key: &[u8], value: &[u8]) -> Result<bool, BTreeError> {
+        let page_size = pager.page_size();
+
+        let max = max_key_len(page_size);
+        if key.len() > max {
+            return Err(BTreeError::KeyTooLarge {
+                len: key.len(),
+                max,
+            });
+        }
+        if !fits_inline(page_size, key.len(), value.len()) {
+            return Err(BTreeError::Unsupported {
+                what: "overflow values (Phase 2, step 8)",
+            });
+        }
+
+        let mut buffer = page_buffer(pager);
+        let leaf_id = self.find_leaf(pager, key, &mut buffer)?;
+
+        let node_error = |source| BTreeError::Node {
+            page: leaf_id,
+            source,
+        };
+        // The read view's borrow of `buffer` ends after its last use, so the
+        // mutable view below can take the buffer afterwards.
+        let leaf = LeafNode::new(&buffer).map_err(node_error)?;
+        let (index, replaced) = match leaf.search(key).map_err(node_error)? {
+            Ok(index) => {
+                let old = leaf.cell(index).map_err(node_error)?;
+                if matches!(old.value, ValueRef::Overflow { .. }) {
+                    return Err(BTreeError::Unsupported {
+                        what: "replacing overflow values (Phase 2, step 8)",
+                    });
+                }
+                (index, true)
+            }
+            Err(index) => (index, false),
+        };
+
+        let mut leaf = LeafNodeMut::new(&mut buffer).map_err(node_error)?;
+        if replaced {
+            leaf.remove(index).map_err(node_error)?;
+        }
+        match leaf.insert(index, key, ValueRef::Inline(value)) {
+            Ok(()) => {}
+            Err(NodeError::Page(PageError::PageFull { .. })) => {
+                return Err(BTreeError::Unsupported {
+                    what: "node splits (Phase 2, step 6)",
+                });
+            }
+            Err(source) => return Err(node_error(source)),
+        }
+
+        pager.write_page(leaf_id, &mut buffer)?;
+
+        Ok(replaced)
     }
 
     /// Descends from the root to the leaf whose subtree can hold `key`

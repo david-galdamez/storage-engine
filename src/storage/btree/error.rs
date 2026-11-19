@@ -59,9 +59,15 @@ pub enum BTreeError {
     #[error("Corrupt tree, page_id: {page}, reason: {reason}")]
     CorruptTree { page: PageId, reason: &'static str },
 
-    /// The operation needs a feature that is not implemented yet. Temporary:
-    /// removed in Phase 2 step 8, when overflow chains exist. Field `what`
-    /// names the missing feature.
+    /// `put` was given a key longer than `max_key_len` for the page size. This
+    /// is a caller error, not corruption: nothing was read or written. Field
+    /// `len` is the rejected length; field `max` is the limit.
+    #[error("Key too large, len: {len} - max: {max}")]
+    KeyTooLarge { len: usize, max: usize },
+
+    /// The operation needs a feature that is not implemented yet: node splits
+    /// (Phase 2, step 6) or overflow chains (step 8). Temporary: removed when
+    /// both exist. Field `what` names the missing feature.
     #[error("Unsupported: {what}")]
     Unsupported { what: &'static str },
 }
