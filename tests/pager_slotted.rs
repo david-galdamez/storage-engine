@@ -35,6 +35,10 @@
 //!   Property tests check random bytes (no panics), random inserts against a
 //!   `Vec` model, and random inserts, removes and compactions against a model
 //!   that predicts which inserts must fit.
+//! - Model tests (step 10): the page used as a sorted B+Tree leaf behaves like
+//!   a `BTreeMap` (search ranks, free space, `PageFull` leaves the buffer
+//!   unchanged), and `compact` gives the same bytes for the same cells
+//!   whatever the history that produced them.
 //!
 //! Expected values do not come from the code under test: offsets and encoded
 //! bytes are written as literals (little-endian).
@@ -65,7 +69,10 @@
 //! total_free }, CorruptSlottedPage { .. }
 //! ```
 
+mod common;
+
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use anyhow::{Context, ensure};
 use proptest::prelude::*;
@@ -77,6 +84,11 @@ use storage_engine_rs::storage::pager::slotted::{
     SLOT_SIZE, SLOTTED_HEADER_SIZE, SlottedPage, SlottedPageMut, max_cell_len,
 };
 use storage_engine_rs::storage::pager::types::PageSize;
+
+use common::{
+    add, cells_of, check_compacted, check_free_gap_zeroed, check_invariants, check_no_holes,
+    count_of, empty_page, fragmented_of, free_end_of, free_start_of, mul, slice, sub,
+};
 
 /// Page sizes allowed by ADR 0001 that the tests cover: smallest, default, largest.
 const SIZES: [usize; 3] = [512, 4096, 65536];
@@ -91,25 +103,6 @@ const OFF_SLOTS: usize = 32;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn add(a: usize, b: usize) -> anyhow::Result<usize> {
-    a.checked_add(b).context("add overflow")
-}
-
-fn sub(a: usize, b: usize) -> anyhow::Result<usize> {
-    a.checked_sub(b).context("sub underflow")
-}
-
-fn mul(a: usize, b: usize) -> anyhow::Result<usize> {
-    a.checked_mul(b).context("mul overflow")
-}
-
-/// `len` bytes of `buf` starting at `at`.
-fn slice(buf: &[u8], at: usize, len: usize) -> anyhow::Result<&[u8]> {
-    let end = add(at, len)?;
-    buf.get(at..end)
-        .with_context(|| format!("range {at}..{end} past buffer of {}", buf.len()))
-}
-
 /// Overwrites bytes of `buf` starting at `at`.
 fn put(buf: &mut [u8], at: usize, bytes: &[u8]) -> anyhow::Result<()> {
     let end = add(at, bytes.len())?;
@@ -117,14 +110,6 @@ fn put(buf: &mut [u8], at: usize, bytes: &[u8]) -> anyhow::Result<()> {
         .context("range past buffer")?
         .copy_from_slice(bytes);
     Ok(())
-}
-
-fn u16_at(buf: &[u8], at: usize) -> anyhow::Result<u16> {
-    Ok(u16::from_le_bytes(slice(buf, at, 2)?.try_into()?))
-}
-
-fn u32_at(buf: &[u8], at: usize) -> anyhow::Result<u32> {
-    Ok(u32::from_le_bytes(slice(buf, at, 4)?.try_into()?))
 }
 
 fn put_u16(buf: &mut [u8], at: usize, value: u16) -> anyhow::Result<()> {
@@ -142,26 +127,6 @@ fn put_slot(buf: &mut [u8], index: usize, offset: u16, len: u16) -> anyhow::Resu
     put_u16(buf, add(at, 2)?, len)
 }
 
-fn count_of(buf: &[u8]) -> anyhow::Result<usize> {
-    Ok(usize::from(u16_at(buf, OFF_CELL_COUNT)?))
-}
-
-fn fragmented_of(buf: &[u8]) -> anyhow::Result<usize> {
-    Ok(usize::from(u16_at(buf, OFF_FRAGMENTED)?))
-}
-
-fn free_end_of(buf: &[u8]) -> anyhow::Result<usize> {
-    Ok(usize::try_from(u32_at(buf, OFF_FREE_END)?)?)
-}
-
-/// A page of `size` bytes, prefilled with 0xAA and then initialized, so any
-/// byte `init` forgets to write shows up.
-fn empty_page(size: usize) -> anyhow::Result<Vec<u8>> {
-    let mut buf = vec![0xAA; size];
-    SlottedPageMut::init(&mut buf)?;
-    Ok(buf)
-}
-
 fn insert(buf: &mut [u8], index: usize, cell: &[u8]) -> Result<(), PageError> {
     SlottedPageMut::new(buf)?.insert(index, cell)
 }
@@ -177,19 +142,6 @@ fn compact(buf: &mut [u8]) -> Result<(), PageError> {
 /// `compact` on a view, for `mut_view_rejects`.
 fn compact_view(page: &mut SlottedPageMut<'_>) -> Result<(), PageError> {
     page.compact()
-}
-
-/// `free_start`, computed from the raw `cell_count`.
-fn free_start_of(buf: &[u8]) -> anyhow::Result<usize> {
-    add(OFF_SLOTS, mul(4, count_of(buf)?)?)
-}
-
-/// Every cell of the page, in logical order, copied out.
-fn cells_of(buf: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
-    let page = SlottedPage::new(buf)?;
-    (0..page.cell_count())
-        .map(|i| Ok(page.cell(i)?.to_vec()))
-        .collect()
 }
 
 /// A 512-byte page with the cells `ab` (index 0) and `hello` (index 1).
@@ -221,111 +173,6 @@ fn fragmented_page() -> anyhow::Result<Vec<u8>> {
     ensure!(fragmented_of(&buf)? == 400, "fixture: fragmented_bytes");
     ensure!(free_end_of(&buf)? == 105, "fixture: free_end");
     Ok(buf)
-}
-
-/// The free gap `[free_start, free_end)` must be all zeros: `init` zeroes it,
-/// `remove` zeroes the slot it frees, and `compact` zeroes the bytes it vacates.
-fn check_free_gap_zeroed(buf: &[u8]) -> anyhow::Result<()> {
-    let free_start = free_start_of(buf)?;
-    let free_end = free_end_of(buf)?;
-    let gap = slice(buf, free_start, sub(free_end, free_start)?)?;
-    let first = gap.iter().position(|&b| b != 0);
-    ensure!(
-        first.is_none(),
-        "free gap [{free_start}, {free_end}) has a non-zero byte at {:?}",
-        first.map(|at| free_start.saturating_add(at))
-    );
-    Ok(())
-}
-
-/// I1 to I4 hold, `fragmented_bytes` is 0 and the free gap is zeroed. With I3
-/// and I4 this means the live cells fill `[free_end, size)` exactly, with no
-/// holes, in any physical order. This is the state after an insert that had
-/// to compact: the new cell sits at `free_end` whatever its logical index.
-fn check_no_holes(buf: &[u8]) -> anyhow::Result<()> {
-    check_invariants(buf)?;
-    let fragmented = fragmented_of(buf)?;
-    ensure!(
-        fragmented == 0,
-        "fragmented_bytes is {fragmented}, expected 0"
-    );
-    check_free_gap_zeroed(buf)
-}
-
-/// The layout right after `compact`, from the raw bytes: no holes, and the
-/// cells in logical order from low to high addresses. Cell 0 starts at
-/// `free_end`, each next cell starts where the previous one ends, and the
-/// last cell ends at the page end.
-fn check_compacted(buf: &[u8]) -> anyhow::Result<()> {
-    check_no_holes(buf)?;
-    let mut expected_offset = free_end_of(buf)?;
-    for i in 0..count_of(buf)? {
-        let at = add(OFF_SLOTS, mul(4, i)?)?;
-        let offset = usize::from(u16_at(buf, at)?);
-        let len = usize::from(u16_at(buf, add(at, 2)?)?);
-        ensure!(
-            offset == expected_offset,
-            "slot {i}: offset {offset}, expected {expected_offset} (logical order)"
-        );
-        expected_offset = add(offset, len)?;
-    }
-    ensure!(
-        expected_offset == buf.len(),
-        "the last cell ends at {expected_offset}, not at the page end"
-    );
-    Ok(())
-}
-
-/// Checks the invariants I1 to I4 of ADR 0003 from the raw bytes, without
-/// using the API under test. I3 (no overlap) sorts the slots by offset.
-fn check_invariants(buf: &[u8]) -> anyhow::Result<()> {
-    let size = buf.len();
-    ensure!(buf.get(4) == Some(&3), "page type byte is {:?}", buf.get(4));
-    let count = count_of(buf)?;
-    let fragmented = fragmented_of(buf)?;
-    let free_end = free_end_of(buf)?;
-    let free_start = add(OFF_SLOTS, mul(4, count)?)?;
-    // I1
-    ensure!(
-        free_start <= free_end && free_end <= size,
-        "I1: free_start {free_start}, free_end {free_end}, size {size}"
-    );
-    // I2
-    let mut slots = Vec::new();
-    let mut live = 0usize;
-    for i in 0..count {
-        let at = add(OFF_SLOTS, mul(4, i)?)?;
-        let offset = usize::from(u16_at(buf, at)?);
-        let len = usize::from(u16_at(buf, add(at, 2)?)?);
-        ensure!(len >= 1, "I2: slot {i} has len 0");
-        ensure!(
-            offset >= free_end,
-            "I2: slot {i} offset {offset} < {free_end}"
-        );
-        ensure!(
-            add(offset, len)? <= size,
-            "I2: slot {i} ends at {} > {size}",
-            add(offset, len)?
-        );
-        live = add(live, len)?;
-        slots.push((offset, len));
-    }
-    // I3
-    slots.sort_unstable();
-    for pair in slots.windows(2) {
-        if let [(offset, len), (next, _)] = pair {
-            ensure!(
-                add(*offset, *len)? <= *next,
-                "I3: cell at {offset} (len {len}) overlaps cell at {next}"
-            );
-        }
-    }
-    // I4
-    ensure!(
-        sub(size, free_end)? == add(live, fragmented)?,
-        "I4: {size} - {free_end} != {live} + {fragmented}"
-    );
-    Ok(())
 }
 
 /// The bytes a slotted page must never change on insert and remove: the
@@ -1696,5 +1543,214 @@ proptest! {
         ops in prop::collection::vec(op_strategy(), 1..=80)
     ) {
         run_ops_against_model(ops).map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model tests (step 10)
+// ---------------------------------------------------------------------------
+
+/// One random operation for the sorted-leaf model. Keys are `u16` in `0..64`.
+#[derive(Debug, Clone)]
+enum LeafOp {
+    Put(u16, Vec<u8>),
+    Delete(u16),
+    Get(u16),
+    Compact,
+}
+
+/// The cell a B+Tree leaf stores for `key` and `value`: the key in big-endian
+/// (so the byte order is the numeric order), then the value.
+fn leaf_cell(key: u16, value: &[u8]) -> Vec<u8> {
+    let mut cell = key.to_be_bytes().to_vec();
+    cell.extend_from_slice(value);
+    cell
+}
+
+/// Compares the key stored at the start of `cell` with `key`.
+fn cmp_leaf_key(cell: &[u8], key: u16) -> Ordering {
+    let wanted = key.to_be_bytes();
+    cell.get(..2).unwrap_or_default().cmp(wanted.as_slice())
+}
+
+/// Number of keys in `model` below `key`: the rank the page must report.
+fn leaf_rank(model: &BTreeMap<u16, Vec<u8>>, key: u16) -> usize {
+    model.range(..key).count()
+}
+
+/// Total free bytes of a leaf page of `size` bytes holding `model`: the page
+/// minus the 32-byte header, minus for each entry one 4-byte slot, the 2-byte
+/// key and the value (ADR 0003).
+fn leaf_model_free(size: usize, model: &BTreeMap<u16, Vec<u8>>) -> anyhow::Result<usize> {
+    let used = model.values().try_fold(0usize, |acc, value| {
+        let entry = add(add(SLOT_SIZE, 2)?, value.len())?;
+        add(acc, entry)
+    })?;
+    sub(sub(size, SLOTTED_HEADER_SIZE)?, used)
+}
+
+fn leaf_op_strategy(size: usize) -> impl Strategy<Value = LeafOp> {
+    // The largest value that fits in an empty page: max_cell_len minus the key.
+    let max_value = size
+        .saturating_sub(SLOTTED_HEADER_SIZE)
+        .saturating_sub(SLOT_SIZE)
+        .saturating_sub(2);
+    let value = prop_oneof![
+        8 => prop::collection::vec(any::<u8>(), 0..=32usize),
+        1 => prop::collection::vec(any::<u8>(), 0..=max_value),
+    ];
+    prop_oneof![
+        4 => (0u16..64, value).prop_map(|(key, value)| LeafOp::Put(key, value)),
+        2 => (0u16..64).prop_map(LeafOp::Delete),
+        2 => (0u16..64).prop_map(LeafOp::Get),
+        1 => Just(LeafOp::Compact),
+    ]
+}
+
+/// Searches the page for `key` with the leaf comparator.
+fn leaf_search(buf: &[u8], key: u16) -> anyhow::Result<Result<usize, usize>> {
+    let page = SlottedPage::new(buf)?;
+    Ok(page.search_by(|cell| cmp_leaf_key(cell, key))?)
+}
+
+/// Runs `ops` on a page of `size` bytes used as a sorted B+Tree leaf and on a
+/// `BTreeMap` model. Operations that cannot happen (a put that does not fit,
+/// a delete of a missing key) are no-ops that check the page refuses or
+/// ignores them, so shrinking stays valid.
+fn run_leaf_ops(size: usize, ops: Vec<LeafOp>) -> anyhow::Result<()> {
+    let mut buf = empty_page(size)?;
+    let mut model: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+    for op in ops {
+        match op {
+            LeafOp::Put(key, value) => {
+                let cell = leaf_cell(key, &value);
+                let found = leaf_search(&buf, key)?;
+                let rank = leaf_rank(&model, key);
+                if model.contains_key(&key) {
+                    ensure!(found == Ok(rank), "put {key}: present, got {found:?}");
+                } else {
+                    ensure!(found == Err(rank), "put {key}: absent, got {found:?}");
+                    let needed = add(cell.len(), SLOT_SIZE)?;
+                    if needed <= leaf_model_free(size, &model)? {
+                        insert(&mut buf, rank, &cell)
+                            .with_context(|| format!("put {key} at rank {rank}"))?;
+                        model.insert(key, value);
+                    } else {
+                        let before = buf.clone();
+                        let error = insert(&mut buf, rank, &cell).err();
+                        ensure!(
+                            matches!(error, Some(PageError::PageFull { .. })),
+                            "put {key}: expected PageFull, got {error:?}"
+                        );
+                        ensure!(buf == before, "a failed put changed the buffer");
+                    }
+                }
+            }
+            LeafOp::Delete(key) => {
+                let found = leaf_search(&buf, key)?;
+                let rank = leaf_rank(&model, key);
+                if model.remove(&key).is_some() {
+                    ensure!(found == Ok(rank), "delete {key}: present, got {found:?}");
+                    remove(&mut buf, rank).with_context(|| format!("delete rank {rank}"))?;
+                } else {
+                    ensure!(found == Err(rank), "delete {key}: absent, got {found:?}");
+                }
+            }
+            LeafOp::Get(key) => {
+                let found = leaf_search(&buf, key)?;
+                let rank = leaf_rank(&model, key);
+                match model.get(&key) {
+                    Some(value) => {
+                        ensure!(found == Ok(rank), "get {key}: present, got {found:?}");
+                        let page = SlottedPage::new(&buf)?;
+                        ensure!(
+                            page.cell(rank)? == leaf_cell(key, value).as_slice(),
+                            "get {key}: cell bytes differ"
+                        );
+                    }
+                    None => ensure!(found == Err(rank), "get {key}: absent, got {found:?}"),
+                }
+            }
+            LeafOp::Compact => {
+                compact(&mut buf).context("compact")?;
+                check_compacted(&buf)?;
+            }
+        }
+        check_invariants(&buf)?;
+        check_free_gap_zeroed(&buf)?;
+        let expected: Vec<Vec<u8>> = model.iter().map(|(k, v)| leaf_cell(*k, v)).collect();
+        ensure!(cells_of(&buf)? == expected, "cells differ from the model");
+        let page = SlottedPage::new(&buf)?;
+        ensure!(
+            page.total_free() == leaf_model_free(size, &model)?,
+            "total_free {} differs from the model",
+            page.total_free()
+        );
+        ensure!(page.validate().is_ok(), "validate failed");
+    }
+    Ok(())
+}
+
+/// Builds a 512-byte page from `ops` (inserts that do not fit are ignored),
+/// compacts it, and returns it with the cells it must hold.
+fn build_compacted(ops: Vec<Op>) -> anyhow::Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut buf = empty_page(512)?;
+    let mut model: Vec<Vec<u8>> = Vec::new();
+    for op in ops {
+        match op {
+            Op::Insert(selector, cell) => {
+                let index = selector.index(add(model.len(), 1)?);
+                match insert(&mut buf, index, &cell) {
+                    Ok(()) => model.insert(index, cell),
+                    Err(PageError::PageFull { .. }) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Op::Remove(selector) => {
+                if !model.is_empty() {
+                    let index = selector.index(model.len());
+                    remove(&mut buf, index)?;
+                    model.remove(index);
+                }
+            }
+            Op::Compact => compact(&mut buf)?,
+        }
+    }
+    compact(&mut buf)?;
+    Ok((buf, model))
+}
+
+/// Compacting a page gives the same bytes as appending the same cells to an
+/// empty page and compacting, whatever the history that produced the cells.
+fn check_history_independence(ops: Vec<Op>) -> anyhow::Result<()> {
+    let (a, model) = build_compacted(ops)?;
+    let mut b = empty_page(512)?;
+    for (index, cell) in model.iter().enumerate() {
+        insert(&mut b, index, cell).with_context(|| format!("rebuild: insert {index}"))?;
+    }
+    compact(&mut b)?;
+    ensure!(a == b, "same cells, different bytes after compact");
+    let mut again = a.clone();
+    compact(&mut again)?;
+    ensure!(again == a, "a second compact changed the page");
+    Ok(())
+}
+
+proptest! {
+    #[test]
+    fn prop_sorted_leaf_matches_btreemap(
+        (size, ops) in prop::sample::select(vec![512usize, 4096, 65536]).prop_flat_map(
+            |size| (Just(size), prop::collection::vec(leaf_op_strategy(size), 1..=100))
+        )
+    ) {
+        run_leaf_ops(size, ops).map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
+    }
+
+    #[test]
+    fn prop_compaction_is_history_independent(
+        ops in prop::collection::vec(op_strategy(), 1..=80)
+    ) {
+        check_history_independence(ops)
+            .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
     }
 }
