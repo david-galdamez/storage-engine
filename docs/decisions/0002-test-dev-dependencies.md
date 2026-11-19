@@ -42,5 +42,11 @@ AGENTS.md section 7 requires an ADR for every new dependency.
 
 - Test builds take longer because of the extra crates.
 - No effect on the shipped binary or library.
-- `proptest` may write `proptest-regressions/` files when a property fails.
-  These files should be committed when they appear.
+- `proptest` writes a `tests/<test file>.proptest-regressions` file next to
+  each integration test file that has a failing property (for example
+  `tests/pager_codec.proptest-regressions`). These files should be committed
+  when they appear.
+
+Amendment (2026-11-18): this section first said that the files go in
+`proptest-regressions/`. That was wrong. The files sit next to the test file,
+as described above.
