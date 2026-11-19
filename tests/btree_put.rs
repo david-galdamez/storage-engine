@@ -1,8 +1,9 @@
-//! Tests for `BTree::put` (Phase 2, step 5): insert and upsert without splits.
+//! Tests for `BTree::put` (Phase 2, step 5): insert and upsert.
 //!
-//! Splits do not exist yet, so a put into a full leaf gives `Unsupported`.
-//! Multi-level trees are built by hand with the helpers in `btree_support`,
-//! with leaves that have a little free room. Page size is 512 bytes.
+//! The split cases are in `btree_split.rs`; here a full leaf is split and
+//! every key is kept. Multi-level trees are built by hand with the helpers in
+//! `btree_support`, with leaves that have a little free room. Page size is 512
+//! bytes.
 //!
 //! The tests check:
 //!
@@ -12,7 +13,7 @@
 //!   errors one byte past each limit (`Unsupported`, `KeyTooLarge`), with the
 //!   file unchanged;
 //! - keys inserted in random order end up in ascending order;
-//! - a full leaf gives `Unsupported` (node splits) and the file is unchanged;
+//! - a put into a full leaf splits it and every key is kept;
 //! - many replaces of one key reclaim fragmented space (compaction);
 //! - a put into a three-level tree routes the key to the right leaf;
 //! - replacing an overflow value gives `Unsupported`, nothing is written;
@@ -238,7 +239,7 @@ fn random_order_inserts_end_up_sorted() -> anyhow::Result<()> {
 }
 
 #[test]
-fn full_leaf_needs_a_split_and_leaves_the_file_unchanged() -> anyhow::Result<()> {
+fn full_leaf_is_split_and_every_key_is_kept() -> anyhow::Result<()> {
     let (_dir, path) = temp_db()?;
     let mut pager = new_pager(&path)?;
     let tree = BTree::create(&mut pager)?;
@@ -247,33 +248,26 @@ fn full_leaf_needs_a_split_and_leaves_the_file_unchanged() -> anyhow::Result<()>
     let mut inserted = Vec::new();
     for i in 0..100usize {
         let key = format!("k{i:03}").into_bytes();
-        let before = file_bytes(&path)?;
-        match tree.put(&mut pager, &key, &value) {
-            Ok(replaced) => {
-                ensure!(!replaced, "new key reported replace");
-                inserted.push(key);
+        ensure!(
+            !tree.put(&mut pager, &key, &value)?,
+            "new key reported replace"
+        );
+        inserted.push(key);
+
+        // The first split turns the root leaf into an internal node.
+        if InternalNode::new(&read(&pager, tree.root())?).is_ok() {
+            ensure!(
+                inserted.len() > 5,
+                "leaf split too early: {}",
+                inserted.len()
+            );
+            for key in &inserted {
+                ensure_value(get(tree, &pager, key)?.as_deref(), &value, "kept key")?;
             }
-            Err(err) => {
-                ensure_unsupported(&err, "node splits")?;
-                ensure!(file_bytes(&path)? == before, "file changed by a failed put");
-                ensure!(
-                    inserted.len() > 5,
-                    "leaf filled too early: {}",
-                    inserted.len()
-                );
-                for key in &inserted {
-                    ensure_value(get(tree, &pager, key)?.as_deref(), &value, "kept key")?;
-                }
-                ensure_missing(get(tree, &pager, &key)?.as_deref(), "rejected key")?;
-                ensure!(
-                    leaf_entries(&pager, tree.root())?.len() == inserted.len(),
-                    "count"
-                );
-                return Ok(());
-            }
+            return Ok(());
         }
     }
-    bail!("the leaf never filled up")
+    bail!("the leaf never split")
 }
 
 #[test]

@@ -3,8 +3,8 @@
 //! The node format is described in ADR 0005
 //! (`docs/decisions/0005-btree-node-format.md`). This module has the node
 //! level (borrowed read and write views of one leaf or internal node, and the
-//! cell encodings) and the tree handle. Descending, splitting and the other
-//! operations come in later steps.
+//! cell encodings) and the tree handle with lookup, insert and leaf splits.
+//! Internal node splits, overflow pages, scans and delete come in later steps.
 //!
 //! - [`node`](self::node): size limits, [`node::ValueRef`] and the leaf cell codec.
 //! - [`leaf`](self::leaf): [`leaf::LeafNode`] and [`leaf::LeafNodeMut`].
