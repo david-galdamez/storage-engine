@@ -51,7 +51,7 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 4   | Lookup                        | `get`: descend from the root to a leaf                                                 | Ch. 2 B-Tree Lookup Algorithm                                  | Done    |
 | 5   | Insert without splits         | `put` into a root leaf, with upsert                                                    | Ch. 2 Node Splits                                              | Done    |
 | 6   | Leaf split                    | Split a full leaf, with right-only appends; keep the root page id stable              | Ch. 2 Node Splits; Ch. 4 Propagating Splits and Merges         | Done    |
-| 7   | Internal split                | Split internal nodes and propagate through breadcrumbs, any height                    | Ch. 4 Breadcrumbs                                              | Planned |
+| 7   | Internal split                | Split internal nodes and propagate through breadcrumbs, any height                    | Ch. 4 Breadcrumbs                                              | Done    |
 | 8   | Overflow pages                | Store values larger than the inline limit in a chain of overflow pages                | Ch. 4 Overflow Pages                                           | Planned |
 | 9   | Range cursor                  | Forward and reverse scans with inclusive, exclusive and unbounded ends                | Ch. 4 Sibling Links, Breadcrumbs                               | Planned |
 | 10  | Delete                        | Remove a key and free its overflow pages, without rebalancing                          | —                                                              | Planned |

@@ -252,7 +252,9 @@ there is no migration.
 5. A leaf split moves the upper half by bytes to a new right leaf and copies
    the first key of the new leaf up as the separator. An internal split moves
    the middle key up (it is not kept in either half): the left node's
-   rightmost child becomes that cell's child.
+   rightmost child becomes that cell's child. The middle is chosen by bytes,
+   like the leaf split: cell `m` of the `n` cells (the old cells plus the new
+   one), with `m` in `1..=n-2` so both halves keep at least one cell.
 
    Exception, right-only appends (*Database Internals* ch. 4): when the new
    key goes after the last cell of the rightmost leaf of the tree, the full
@@ -300,3 +302,29 @@ added to this ADR as an amendment.
   until the WAL exists (Phase 3).
 - Format version 2. Amends ADR 0003: byte 24 (`flags`) is no longer reserved
   on node pages, and bytes 44..48 of the file header hold `catalog_root`.
+
+## Amendment 1 (2026-11-20): owned separator during splits
+
+Phase 2, step 7 propagates a split up the tree. At each level a separator key
+goes into the parent. That key is the first key of the new right leaf, or the
+key promoted out of an internal node. `put` keeps it in one owned `Vec<u8>`.
+AGENTS.md section 5.1 asks to try borrowing first:
+
+1. **Restructure or borrow from the source buffer.** The source buffer (the
+   right leaf, or the internal node that split) moves into the list of pending
+   writes while the next level is processed. A borrow from it conflicts with
+   pushing more buffers to that list. For the leaf, the right buffer is itself
+   a pending write.
+2. **Borrowed view into the buffer.** Same problem: the owner of the bytes
+   moves.
+3. **Indices or offsets into the buffer.** Same problem. The index would need
+   a buffer that stays in place, and no buffer does.
+4. **`Cow`.** It does not help. Every level of a split needs the owned form.
+5. **Arena.** The buffer pool (Phase 4) is that owner. Revisit this decision
+   then.
+6. **Owned data.** One `Vec<u8>` is allocated once per `put` that splits and
+   reused at every level (`clear` and `extend_from_slice`). It holds at most
+   `max_key_len` bytes. A `put` that does not split allocates nothing for it.
+
+**Decision:** option 6. The page buffers stay owned `Vec<u8>` as in option 7
+of this ADR.

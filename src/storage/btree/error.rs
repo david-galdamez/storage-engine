@@ -65,9 +65,9 @@ pub enum BTreeError {
     #[error("Key too large, len: {len} - max: {max}")]
     KeyTooLarge { len: usize, max: usize },
 
-    /// The operation needs a feature that is not implemented yet: internal
-    /// node splits (Phase 2, step 7) or overflow chains (step 8). Temporary:
-    /// removed when both exist. The operation changes nothing in the file.
+    /// The operation needs a feature that is not implemented yet: overflow
+    /// chains (Phase 2, step 8). Temporary: removed when they exist. The
+    /// operation changes nothing in the file.
     /// Field `what` names the missing feature.
     #[error("Unsupported: {what}")]
     Unsupported { what: &'static str },

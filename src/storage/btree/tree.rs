@@ -2,27 +2,29 @@
 //!
 //! A [`BTree`] is a small `Copy` value that stores only the page id of the
 //! root of one tree. The root page id never changes while the tree lives
-//! (ADR 0005, option 4: a root split moves the old root's contents to a new
-//! page), so it is also the id of the tree and the catalog can store it.
+//! (ADR 0005, option 4: a root split moves the old root's contents to new
+//! pages), so it is also the id of the tree and the catalog can store it.
 //!
 //! The handle does not own the pager. Every operation takes the pager as an
 //! argument: `&Pager` for reads and `&mut Pager` for writes. Many trees share
 //! one pager, and the borrow checker keeps writes and reads apart.
 //!
 //! This step has [`BTree::create`], [`BTree::open`], [`BTree::get`] and
-//! [`BTree::put`]. `put` splits a full leaf (including the root leaf, which
-//! keeps its page id). It does not split internal nodes yet: when the parent
-//! has no room for the new separator it fails with
-//! [`BTreeError::Unsupported`] and changes nothing. Delete and scans come in
-//! later steps (see the Phase 2 roadmap).
+//! [`BTree::put`]. `put` splits a full leaf and propagates the split up through
+//! the breadcrumbs of the descent: a full parent splits too, at any height,
+//! and a split root keeps its page id. Overflow values, delete and scans come
+//! in later steps (see the Phase 2 roadmap).
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 use crate::storage::btree::{
     error::{BTreeError, NodeError},
     internal::{InternalNode, InternalNodeMut},
     leaf::{LeafNode, LeafNodeMut},
-    node::{LeafCell, ValueRef, fits_inline, leaf_cell_len, max_key_len},
+    node::{
+        INTERNAL_CELL_HEADER_SIZE, LeafCell, ValueRef, fits_inline, leaf_cell_len, max_key_len,
+    },
 };
 use crate::storage::pager::{
     disk::Pager,
@@ -49,6 +51,8 @@ struct Crumb {
     /// The child position taken in it, in `0..=N` (see
     /// [`InternalNode::child_for`]).
     pos: usize,
+    /// `true` if the descent took the rightmost child (`pos == N`).
+    last: bool,
 }
 
 /// The breadcrumbs of a descent: the internal nodes from the root down to the
@@ -58,9 +62,8 @@ struct Crumb {
 /// It is filled by `BTree::find_leaf` and has no heap allocation: a fixed array
 /// of [`MAX_TREE_HEIGHT`] crumbs is enough, because a descent never visits
 /// more levels. The path is empty when the root is the leaf. A leaf split reads
-/// the last crumb to find the parent that receives the separator. Step 7 (the
-/// internal split) will walk the crumbs upward to propagate a split to the
-/// grandparent and above.
+/// the crumbs from the bottom up to find the parent that receives the
+/// separator, and the grandparent and above if the split propagates.
 #[derive(Debug)]
 struct Path {
     crumbs: [Crumb; MAX_TREE_HEIGHT],
@@ -74,6 +77,7 @@ impl Path {
             crumbs: [Crumb {
                 page: filler,
                 pos: 0,
+                last: false,
             }; MAX_TREE_HEIGHT],
             len: 0,
         }
@@ -99,11 +103,10 @@ impl Path {
         Ok(())
     }
 
-    /// Returns the crumb closest to the leaf: the parent of the leaf. `None`
-    /// if the leaf is the root.
-    fn last(&self) -> Option<Crumb> {
-        let last = self.len.checked_sub(1)?;
-        self.crumbs.get(last).copied()
+    /// Returns the crumbs from the root down to the parent of the leaf. The
+    /// slice is empty when the leaf is the root.
+    fn as_slice(&self) -> &[Crumb] {
+        self.crumbs.get(..self.len).unwrap_or_default()
     }
 }
 
@@ -276,33 +279,34 @@ impl BTree {
     /// height. If the leaf has room, the change is made in the leaf's page
     /// buffer and the page is written once, only after the change succeeded.
     ///
-    /// If the leaf is full it is split (ADR 0005, invariant 5). The root leaf
-    /// is split in a way that keeps the root page id. When the parent has no
-    /// room for the new separator, the parent would have to be split too:
-    /// that is Phase 2 step 7, so `put` returns [`BTreeError::Unsupported`]
-    /// before it allocates or writes anything.
+    /// If the leaf is full it is split (ADR 0005, invariant 5), and the split
+    /// goes up through the breadcrumbs: a parent with no room for the new
+    /// separator is split too, and so on up to the root. A root split keeps the
+    /// root page id, and the tree grows one level. `put` never fails because a
+    /// node is full.
     ///
-    /// A split writes several pages and there is no WAL yet (Phase 3). A
-    /// crash or an I/O error between the writes can leave the tree
-    /// inconsistent and allocated pages unused. The pages are written in an
-    /// order that keeps the tree readable as long as possible: new pages
-    /// first, then the split leaf, then the parent. Does not sync.
+    /// A split writes several pages and there is no WAL yet (Phase 3). The
+    /// whole split is planned in memory first, so an error while planning
+    /// writes nothing, but it can leave allocated pages unused. A crash or an
+    /// I/O error between the writes can leave the tree inconsistent. The pages
+    /// are written in an order that keeps the tree readable as long as
+    /// possible: new pages first, then the split leaf, then its ancestors
+    /// bottom-up, so a modified root comes last. Does not sync.
     ///
     /// # Errors
     ///
     /// - [`BTreeError::KeyTooLarge`] if `key` is longer than `max_key_len`.
     /// - [`BTreeError::Unsupported`] if the value does not fit inline
-    ///   (overflow values, Phase 2 step 8), if the old value is in overflow
-    ///   pages, or if the leaf is full and its parent has no room for the
-    ///   separator (internal node splits, Phase 2 step 7). In all these cases
-    ///   the file is unchanged.
+    ///   (overflow values, Phase 2 step 8) or if the old value is in overflow
+    ///   pages. In both cases the file is unchanged.
     /// - [`BTreeError::Pager`] if a read, an allocation or a write fails or a
     ///   checksum is wrong. If this happens during a split, pages may already
     ///   be allocated or written.
     /// - [`BTreeError::Node`] if a node on the path does not decode.
     /// - [`BTreeError::CorruptTree`] if the root or a child is not a B+Tree
-    ///   node, the descent is deeper than the maximum height, or a leaf that
-    ///   must split has fewer than two entries.
+    ///   node, the descent is deeper than the maximum height, a node that
+    ///   must split has too few entries, or a parent does not lead to the
+    ///   child it was reached through.
     pub fn put(self, pager: &mut Pager, key: &[u8], value: &[u8]) -> Result<bool, BTreeError> {
         let page_size = pager.page_size();
 
@@ -365,7 +369,7 @@ impl BTree {
             key,
             value,
         };
-        split_leaf(pager, &path, leaf_id, &mut buffer, insertion)?;
+        split_leaf(pager, &path, leaf_id, buffer, insertion)?;
 
         Ok(replaced)
     }
@@ -400,7 +404,11 @@ impl BTree {
                     };
                     let node = InternalNode::new(buffer).map_err(node_error)?;
                     let (pos, child) = node.child_for(key).map_err(node_error)?;
-                    path.push(Crumb { page: current, pos })?;
+                    path.push(Crumb {
+                        page: current,
+                        pos,
+                        last: pos == node.cell_count(),
+                    })?;
                     current = child;
                 }
                 _ => {
@@ -436,8 +444,43 @@ fn page_buffer(pager: &Pager) -> Vec<u8> {
     vec![0u8; pager.page_size().as_usize()]
 }
 
-/// Splits the full leaf `leaf_id`, whose page is in `buffer`, to make room for
-/// `insertion`, and puts the separator in the parent (ADR 0005, invariants 4
+/// Pages planned by a split. Nothing is written until the whole split is
+/// planned, so a failure while planning leaves the existing pages unchanged
+/// (only allocated pages can be left unused).
+#[derive(Debug, Default)]
+struct Pending {
+    /// Pages allocated by the split, with their final content.
+    new_pages: Vec<(PageId, Vec<u8>)>,
+    /// Existing pages that change, in the order the split reaches them: the
+    /// leaf first, then its ancestors, so a modified root comes last.
+    changed: Vec<(PageId, Vec<u8>)>,
+}
+
+impl Pending {
+    /// Writes the new pages first, then the existing pages bottom-up. If a
+    /// write fails, the tree can be inconsistent until the WAL exists
+    /// (Phase 3). The order keeps it readable as long as possible: until the
+    /// first existing page is written, the old tree is intact.
+    fn write_all(self, pager: &mut Pager) -> Result<(), BTreeError> {
+        for (id, mut buffer) in self.new_pages.into_iter().chain(self.changed) {
+            pager.write_page(id, &mut buffer)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// A node that was just split, in memory: `page` is its page id, `left` the
+/// left half and `right` the right half. Neither half has a page id yet,
+/// except that a non-root `left` keeps `page`.
+struct SplitNode {
+    page: PageId,
+    left: Vec<u8>,
+    right: Vec<u8>,
+}
+
+/// Splits the full leaf `leaf_id`, whose page is `buffer`, to make room for
+/// `insertion`, and propagates the split up the tree (ADR 0005, invariants 4
 /// to 6).
 ///
 /// Let `L` be the leaf and `combined` the cells of `L` with the new cell
@@ -453,36 +496,28 @@ fn page_buffer(pager: &Pager) -> Vec<u8> {
 /// 2. Build `R` in a new buffer. Its `next_leaf` is the old `next_leaf` of `L`.
 /// 3. Shrink `L` in its buffer: remove the cells that moved, from the end
 ///    backwards, and insert the new cell if it belongs to the left part.
-/// 4. The separator is the first key of `R`, copied in full into the parent.
-///    - `L` has a parent: insert the cell (`L`, separator) before the pointer
-///      that led to `L`, and make that pointer lead to `R`. `L` keeps the keys
-///      below the separator and `R` the keys from it up (invariant 4).
-///    - `L` is the root: its page id must not change (ADR 0005, option 4). The
-///      left part moves to a new page, the right part goes to another new page
-///      and the root page becomes an internal node over the two.
+/// 4. The separator is the first key of `R`. `propagate_split` puts it in the
+///    parent, splitting the parent (and its parent...) if it is full.
 ///
-/// No WAL exists yet, so the writes are ordered to do the least damage if
-/// something fails in between: new pages first, then `L`, and the parent
-/// last. A failure after an allocation can leave unused pages in the file,
-/// and a crash between the writes can leave the tree inconsistent until
+/// All the pages are planned in memory and written at the end, new pages
+/// first and existing pages bottom-up (see [`Pending::write_all`]). No WAL
+/// exists yet, so a failure after an allocation can leave unused pages in the
+/// file, and a crash between the writes can leave the tree inconsistent until
 /// Phase 3.
 ///
 /// # Errors
 ///
-/// - [`BTreeError::Unsupported`] if the parent has no room for the separator
-///   (Phase 2 step 7). This is checked in memory before any allocation, so
-///   the file is unchanged.
 /// - [`BTreeError::Pager`] if a read, an allocation or a write fails.
 /// - [`BTreeError::Node`] if a node does not decode or a part does not fit in
 ///   its page, which the size limits (ADR 0005, option 6) rule out in a valid
 ///   tree.
-/// - [`BTreeError::CorruptTree`] if the leaf has fewer than two entries with
-///   the new one, or the parent does not point to the leaf.
+/// - [`BTreeError::CorruptTree`] if a node that must split has too few
+///   entries, or a parent does not point to the child it was reached through.
 fn split_leaf(
     pager: &mut Pager,
     path: &Path,
     leaf_id: PageId,
-    buffer: &mut [u8],
+    mut buffer: Vec<u8>,
     insertion: Insertion<'_>,
 ) -> Result<(), BTreeError> {
     let node_error = |source| BTreeError::Node {
@@ -494,7 +529,7 @@ fn split_leaf(
     // borrows `buffer`, so this block ends before L is changed.
     let mut right = page_buffer(pager);
     let split_at = {
-        let leaf = LeafNode::new(buffer).map_err(node_error)?;
+        let leaf = LeafNode::new(&buffer).map_err(node_error)?;
         let old_next = leaf.next_leaf().map_err(node_error)?;
         let combined = Combined { leaf, insertion };
         if combined.len() < 2 {
@@ -524,14 +559,23 @@ fn split_leaf(
     };
 
     // Step 3: shrink L.
-    shrink_left_leaf(buffer, insertion, split_at).map_err(node_error)?;
+    shrink_left_leaf(&mut buffer, insertion, split_at).map_err(node_error)?;
 
-    // Step 4: the separator is the first key of R. Each finisher below reads
-    // it from the `right` buffer and copies it into the parent.
-    match path.last() {
-        Some(parent) => split_with_parent(pager, leaf_id, buffer, &mut right, parent),
-        None => split_root_leaf(pager, leaf_id, buffer, &mut right),
-    }
+    // Step 4: the separator is the first key of R. It is copied into the one
+    // owned vector of this `put` (ADR 0005, amendment 1), because `right`
+    // moves into the pending writes.
+    let mut separator = Vec::new();
+    separator.extend_from_slice(first_key(&right).map_err(node_error)?);
+
+    let mut pending = Pending::default();
+    let node = SplitNode {
+        page: leaf_id,
+        left: buffer,
+        right,
+    };
+    propagate_split(pager, path, &mut pending, &mut separator, node)?;
+
+    pending.write_all(pager)
 }
 
 /// Chooses the number `k` of combined entries that stay in the left leaf. It
@@ -598,110 +642,333 @@ fn first_key(buffer: &[u8]) -> Result<&[u8], NodeError> {
     LeafNode::new(buffer)?.key(0)
 }
 
-/// Finishes the split of a leaf that has a parent: `parent` is the last crumb
-/// of the descent.
-fn split_with_parent(
+/// Gives the halves of `node`, which just split, to the tree above it
+/// (*Database Internals*, ch. 4, Propagating Splits). `separator` holds the
+/// key that divides the halves.
+///
+/// It walks the breadcrumbs from the parent of `node` up to the root. At each
+/// level it inserts (left page, `separator`) in the parent at the crumb
+/// position and makes the pointer after it lead to the right page. If the
+/// parent has room, the walk ends. If it is full, the parent is split in
+/// memory, its promoted key becomes the new `separator`, and the walk goes on
+/// with the grandparent. If the crumbs run out, the node that split is the
+/// root and [`place_root_split`] gives it a new root.
+fn propagate_split(
     pager: &mut Pager,
-    leaf_id: PageId,
-    left: &mut [u8],
-    right: &mut [u8],
-    parent: Crumb,
+    path: &Path,
+    pending: &mut Pending,
+    separator: &mut Vec<u8>,
+    mut node: SplitNode,
 ) -> Result<(), BTreeError> {
-    let parent_error = |source| BTreeError::Node {
-        page: parent.page,
-        source,
-    };
+    let mut remaining = path.as_slice();
+    while let Some((crumb, above)) = remaining.split_last() {
+        let parent_error = |source| BTreeError::Node {
+            page: crumb.page,
+            source,
+        };
 
-    let separator = first_key(right).map_err(|source| BTreeError::Node {
-        page: leaf_id,
-        source,
-    })?;
-
-    let mut parent_buffer = page_buffer(pager);
-    pager.read_page(parent.page, &mut parent_buffer)?;
-
-    // The parent must lead to L through the position the descent took.
-    let view = InternalNode::new(&parent_buffer).map_err(parent_error)?;
-    if view.child_at(parent.pos).map_err(parent_error)? != leaf_id {
-        return Err(BTreeError::CorruptTree {
-            page: parent.page,
-            reason: "parent does not lead to the leaf it was reached through",
-        });
-    }
-
-    // Insert (L, separator) at the position of the pointer to L. The old
-    // pointer to L moves one position to the right and will lead to R. This
-    // is done in memory before any allocation, so a full parent changes
-    // nothing in the file.
-    let mut node = InternalNodeMut::new(&mut parent_buffer).map_err(parent_error)?;
-    match node.insert(parent.pos, separator, leaf_id) {
-        Ok(()) => {}
-        Err(NodeError::Page(PageError::PageFull { .. })) => {
-            return Err(BTreeError::Unsupported {
-                what: "internal node splits (Phase 2, step 7)",
+        // Check the parent before anything is allocated.
+        let mut parent = page_buffer(pager);
+        pager.read_page(crumb.page, &mut parent)?;
+        let view = InternalNode::new(&parent).map_err(parent_error)?;
+        if view.child_at(crumb.pos).map_err(parent_error)? != node.page {
+            return Err(BTreeError::CorruptTree {
+                page: crumb.page,
+                reason: "parent does not lead to the child it was reached through",
             });
         }
-        Err(source) => return Err(parent_error(source)),
+
+        let (left_id, right_id) = place_split(pager, pending, node)?;
+
+        // Insert (left, separator) at the position of the pointer to the left
+        // page. The old pointer moves one position to the right and must lead
+        // to the right page.
+        let mut parent_node = InternalNodeMut::new(&mut parent).map_err(parent_error)?;
+        match parent_node.insert(crumb.pos, separator, left_id) {
+            Ok(()) => {
+                parent_node
+                    .set_child_at(crumb.pos.saturating_add(1), right_id)
+                    .map_err(parent_error)?;
+                pending.changed.push((crumb.page, parent));
+
+                return Ok(());
+            }
+            Err(NodeError::Page(PageError::PageFull { .. })) => {}
+            Err(source) => return Err(parent_error(source)),
+        }
+
+        // The parent is full: it splits too. A node is on the rightmost spine
+        // when its crumb and all the crumbs above it took the last child.
+        let append = crumb.last && above.iter().all(|c| c.last);
+        let target = InternalTarget {
+            page: crumb.page,
+            buffer: &parent,
+            pos: crumb.pos,
+            left_child: left_id,
+            right_child: right_id,
+            append,
+        };
+        let (left, right) = split_internal(&target, separator)?;
+        node = SplitNode {
+            page: crumb.page,
+            left,
+            right,
+        };
+        remaining = above;
     }
 
-    // From here on the file may change.
-    let right_id = pager.allocate_page()?;
-    node.set_child_at(parent.pos.saturating_add(1), right_id)
-        .map_err(parent_error)?;
-
-    // L -> R -> (old next of L). R already has the old next of L.
-    LeafNodeMut::new(left)
-        .and_then(|mut leaf| leaf.set_next_leaf(Some(right_id)))
-        .map_err(|source| BTreeError::Node {
-            page: leaf_id,
-            source,
-        })?;
-
-    // New page first, then L, the parent last.
-    pager.write_page(right_id, right)?;
-    pager.write_page(leaf_id, left)?;
-    pager.write_page(parent.page, &mut parent_buffer)?;
-
-    Ok(())
+    place_root_split(pager, pending, separator, node)
 }
 
-/// Finishes the split of the root leaf. The root page id never changes (ADR
-/// 0005, option 4), so both parts go to new pages `a` (left) and `b` (right),
-/// and the root page is rewritten as an internal node with the cell
-/// (`a`, separator) and `b` as rightmost child.
-fn split_root_leaf(
+/// Gives page ids to the halves of a node that is not the root and plans their
+/// writes: the left half keeps the page of the node, the right half gets a new
+/// page. For leaves, the left `next_leaf` is set to the right page (the right
+/// half already has the old next leaf). Returns the two page ids.
+fn place_split(
     pager: &mut Pager,
-    root_id: PageId,
-    left: &mut [u8],
-    right: &mut [u8],
+    pending: &mut Pending,
+    node: SplitNode,
+) -> Result<(PageId, PageId), BTreeError> {
+    let SplitNode {
+        page,
+        mut left,
+        right,
+    } = node;
+    let right_id = pager.allocate_page()?;
+    link_leaves(&mut left, right_id).map_err(|source| BTreeError::Node { page, source })?;
+
+    pending.new_pages.push((right_id, right));
+    pending.changed.push((page, left));
+
+    Ok((page, right_id))
+}
+
+/// Plans the split of the root. The root page id never changes (ADR 0005,
+/// option 4), so both halves go to new pages `a` (left) and `b` (right), and
+/// the root page is rewritten as an internal node with the cell
+/// (`a`, `separator`) and `b` as rightmost child. For a leaf root, `a` is
+/// linked to `b`, and `b` keeps the old next leaf.
+fn place_root_split(
+    pager: &mut Pager,
+    pending: &mut Pending,
+    separator: &[u8],
+    node: SplitNode,
 ) -> Result<(), BTreeError> {
+    let SplitNode {
+        page: root_id,
+        mut left,
+        right,
+    } = node;
     let node_error = |source| BTreeError::Node {
         page: root_id,
         source,
     };
-    let separator = first_key(right).map_err(node_error)?;
 
-    // The file may change from here on. If a later step fails, the two pages
-    // stay allocated and unused.
+    // If a later step fails, the two pages stay allocated and unused.
     let left_id = pager.allocate_page()?;
     let right_id = pager.allocate_page()?;
+    link_leaves(&mut left, right_id).map_err(node_error)?;
 
-    // The new root is built in its own buffer, because `left` becomes page a.
     let mut root = page_buffer(pager);
     InternalNodeMut::init(&mut root, right_id).map_err(node_error)?;
     InternalNodeMut::new(&mut root)
         .and_then(|mut node| node.insert(0, separator, left_id))
         .map_err(node_error)?;
 
-    // a -> b. b already has the old next of the root leaf.
-    LeafNodeMut::new(left)
-        .and_then(|mut leaf| leaf.set_next_leaf(Some(right_id)))
-        .map_err(node_error)?;
+    pending.new_pages.push((right_id, right));
+    pending.new_pages.push((left_id, left));
+    pending.changed.push((root_id, root));
 
-    // The two new pages first, the root last.
-    pager.write_page(right_id, right)?;
-    pager.write_page(left_id, left)?;
-    pager.write_page(root_id, &mut root)?;
+    Ok(())
+}
+
+/// If `left` is a leaf, sets its `next_leaf` to `right_id`. Does nothing for an
+/// internal node.
+fn link_leaves(left: &mut [u8], right_id: PageId) -> Result<(), NodeError> {
+    if page_type(left) != Ok(PageType::BTreeLeaf) {
+        return Ok(());
+    }
+
+    LeafNodeMut::new(left)?.set_next_leaf(Some(right_id))
+}
+
+/// The full internal node that has to split, and the cell it must take.
+struct InternalTarget<'a> {
+    /// Page id of the node, for errors.
+    page: PageId,
+    /// The page of the node, unchanged.
+    buffer: &'a [u8],
+    /// Position where the new cell goes, from the crumb.
+    pos: usize,
+    /// The child that split: it is the child of the new cell.
+    left_child: PageId,
+    /// The new right half of that child: it replaces the old pointer, which
+    /// moves to position `pos + 1`.
+    right_child: PageId,
+    /// `true` if the node is on the rightmost spine (right-only append).
+    append: bool,
+}
+
+/// The cells of a full internal node plus the new cell, in key order, without
+/// copying them. Entry `j` is read from the node or is the new cell, on
+/// demand. The child pointers are shifted the same way: the new cell is
+/// (`left_child`, separator) at `pos` and the pointer after it leads to
+/// `right_child`.
+struct CombinedInternal<'a> {
+    node: InternalNode<'a>,
+    pos: usize,
+    separator: &'a [u8],
+    left_child: PageId,
+    right_child: PageId,
+}
+
+impl<'a> CombinedInternal<'a> {
+    /// Number of cells: the cells of the node plus the new one.
+    fn len(&self) -> usize {
+        self.node.cell_count().saturating_add(1)
+    }
+
+    /// Key of cell `j`: `j < pos` is node cell `j`, `j == pos` is the new
+    /// separator and `j > pos` is node cell `j - 1`.
+    fn key(&self, j: usize) -> Result<&'a [u8], NodeError> {
+        match j.cmp(&self.pos) {
+            Ordering::Less => self.node.key(j),
+            Ordering::Equal => Ok(self.separator),
+            Ordering::Greater => self.node.key(j.saturating_sub(1)),
+        }
+    }
+
+    /// Child at position `j`, for `j` in `0..=len`: the child of cell `j`, or
+    /// the rightmost child for `j == len`.
+    fn child_at(&self, j: usize) -> Result<PageId, NodeError> {
+        match j.cmp(&self.pos.saturating_add(1)) {
+            Ordering::Less if j == self.pos => Ok(self.left_child),
+            Ordering::Less => self.node.child_at(j),
+            Ordering::Equal => Ok(self.right_child),
+            Ordering::Greater => self.node.child_at(j.saturating_sub(1)),
+        }
+    }
+
+    /// Bytes that cell `j` uses in a page: its cell plus its slot.
+    fn cell_bytes(&self, j: usize) -> Result<usize, NodeError> {
+        Ok(INTERNAL_CELL_HEADER_SIZE
+            .saturating_add(self.key(j)?.len())
+            .saturating_add(SLOT_SIZE))
+    }
+}
+
+/// Splits the full internal node `target` in memory and returns its two
+/// halves, built in fresh buffers. `separator` is the new cell's key on
+/// entry and the promoted key on return.
+///
+/// Let `n` be the number of combined cells and `m` the chosen cell. The left
+/// half gets the combined cells `0..m` and, as rightmost child, the child of
+/// cell `m`. The key of cell `m` is promoted: it goes up and stays in neither
+/// half (ADR 0005, invariant 5). The right half gets the cells `m + 1..n` and
+/// the rightmost child of the combined node.
+fn split_internal(
+    target: &InternalTarget<'_>,
+    separator: &mut Vec<u8>,
+) -> Result<(Vec<u8>, Vec<u8>), BTreeError> {
+    let node_error = |source| BTreeError::Node {
+        page: target.page,
+        source,
+    };
+
+    let node = InternalNode::new(target.buffer).map_err(node_error)?;
+    let combined = CombinedInternal {
+        node,
+        pos: target.pos,
+        separator: separator.as_slice(),
+        left_child: target.left_child,
+        right_child: target.right_child,
+    };
+    let n = combined.len();
+    if n < 3 {
+        return Err(BTreeError::CorruptTree {
+            page: target.page,
+            reason: "an internal node that must split has fewer than two cells",
+        });
+    }
+
+    let m = choose_internal_split(&combined, target.append).map_err(node_error)?;
+
+    // Both halves are built from the virtual sequence, so every borrowed key
+    // is still valid while it is copied.
+    let mut left = vec![0u8; target.buffer.len()];
+    let mut right = vec![0u8; target.buffer.len()];
+    let left_rightmost = combined.child_at(m).map_err(node_error)?;
+    fill_internal(&mut left, &combined, 0..m, left_rightmost).map_err(node_error)?;
+    let right_rightmost = combined.child_at(n).map_err(node_error)?;
+    let after = m.saturating_add(1);
+    fill_internal(&mut right, &combined, after..n, right_rightmost).map_err(node_error)?;
+
+    // The promoted key is either the new separator (already in the vector) or
+    // a key of the node. The `combined` borrow of the vector ends here.
+    if m != target.pos {
+        let old_index = if m < target.pos {
+            m
+        } else {
+            m.saturating_sub(1)
+        };
+        separator.clear();
+        separator.extend_from_slice(node.key(old_index).map_err(node_error)?);
+    }
+
+    Ok((left, right))
+}
+
+/// Chooses the combined cell `m` that is promoted. It is always in `1..=n - 2`,
+/// so both halves have at least one cell.
+fn choose_internal_split(
+    combined: &CombinedInternal<'_>,
+    append: bool,
+) -> Result<usize, NodeError> {
+    let last = combined.len().saturating_sub(2);
+    if append {
+        // Right-only append: the right half gets only the new cell, and the
+        // left half keeps the old cells but the last, which moves up.
+        return Ok(last);
+    }
+
+    let mut total = 0usize;
+    for j in 0..combined.len() {
+        total = total.saturating_add(combined.cell_bytes(j)?);
+    }
+
+    // The smallest m whose left part (cells `0..m`) uses at least half of the
+    // bytes. The quarter rule (ADR 0005, option 6) means no cell is more than
+    // a quarter, so both halves fit even though the promoted cell leaves.
+    let mut left = 0usize;
+    for m in 1..=last {
+        left = left.saturating_add(combined.cell_bytes(m.saturating_sub(1))?);
+        if left.saturating_mul(2) >= total {
+            return Ok(m);
+        }
+    }
+
+    Ok(last)
+}
+
+/// Formats `buffer` as an internal node with `rightmost` as its rightmost
+/// child and fills it with the combined cells in `cells`.
+fn fill_internal(
+    buffer: &mut [u8],
+    combined: &CombinedInternal<'_>,
+    cells: Range<usize>,
+    rightmost: PageId,
+) -> Result<(), NodeError> {
+    InternalNodeMut::init(buffer, rightmost)?;
+    let mut node = InternalNodeMut::new(buffer)?;
+
+    let start = cells.start;
+    for j in cells {
+        node.insert(
+            j.saturating_sub(start),
+            combined.key(j)?,
+            combined.child_at(j)?,
+        )?;
+    }
 
     Ok(())
 }

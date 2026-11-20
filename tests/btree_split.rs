@@ -17,7 +17,8 @@
 //! - a replace that grows a value in a full leaf splits it;
 //! - a split of a leaf in the middle of the chain links the new leaf between
 //!   the leaf and its old next leaf;
-//! - a full parent gives `Unsupported` and leaves the file byte-identical;
+//! - a full parent splits and the tree grows to three levels (the deeper
+//!   cases are in `btree_internal_split.rs`);
 //! - a split tree survives closing and reopening the file;
 //! - a property test against a `BTreeMap` model.
 
@@ -25,7 +26,6 @@ mod btree_check;
 mod btree_support;
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
 use btree_check::{Entries, check_tree, leaf_chain};
@@ -35,7 +35,7 @@ use btree_support::{
 };
 use proptest::prelude::*;
 use storage_engine_rs::storage::btree::BTree;
-use storage_engine_rs::storage::btree::error::{BTreeError, NodeError};
+use storage_engine_rs::storage::btree::error::NodeError;
 use storage_engine_rs::storage::btree::internal::InternalNode;
 use storage_engine_rs::storage::btree::leaf::{LeafNode, LeafNodeMut};
 use storage_engine_rs::storage::btree::node::ValueRef;
@@ -47,8 +47,6 @@ const VALUE: [u8; 20] = [7u8; 20];
 
 /// Usable bytes of a node page: the page minus the 32-byte header.
 const USABLE: usize = PAGE_SIZE - 32;
-
-const SPLIT_UNSUPPORTED: &str = "internal node splits (Phase 2, step 7)";
 
 fn key(i: usize) -> Vec<u8> {
     format!("k{i:06}").into_bytes()
@@ -102,10 +100,6 @@ fn is_full(pager: &Pager, id: PageId) -> anyhow::Result<bool> {
         Err(NodeError::Page(PageError::PageFull { .. })) => Ok(true),
         Err(other) => bail!("unexpected error: {other:?}"),
     }
-}
-
-fn file_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
-    Ok(std::fs::read(path)?)
 }
 
 /// Puts the standard entry for every `i` in `order`, checking each is new.
@@ -381,35 +375,29 @@ fn split_in_the_middle_of_the_chain_links_the_new_leaf_between() -> anyhow::Resu
 }
 
 #[test]
-fn full_parent_gives_unsupported_and_leaves_the_file_unchanged() -> anyhow::Result<()> {
+fn full_parent_splits_instead_of_failing() -> anyhow::Result<()> {
     let (_dir, path) = temp_db()?;
     let mut pager = new_pager(&path)?;
     let tree = BTree::create(&mut pager)?;
+    let root = tree.root();
 
+    // Insert until the tree has three levels: the first full parent is the
+    // root, and its split used to give `Unsupported`.
     let mut inserted = Vec::new();
     for i in 0..2000usize {
-        let before = file_bytes(&path)?;
-        let count_before = pager.page_count();
-        match tree.put(&mut pager, &key(i), &VALUE) {
-            Ok(replaced) => {
-                ensure!(!replaced, "new key reported replace");
-                inserted.push(i);
-            }
-            Err(BTreeError::Unsupported { what }) => {
-                ensure!(what == SPLIT_UNSUPPORTED, "what: {what}");
-                ensure!(file_bytes(&path)? == before, "the file changed");
-                ensure!(pager.page_count() == count_before, "a page was allocated");
-                ensure!(height(&pager, tree.root())? == 2, "expected two levels");
-                ensure_missing(get(tree, &pager, &key(i))?.as_deref(), "rejected key")?;
-                check_standard(&pager, tree, &inserted)?;
-                // A put that needs no split still works.
-                ensure!(tree.put(&mut pager, &key(0), b"x")?, "replace failed");
-                return Ok(());
-            }
-            Err(other) => bail!("unexpected error: {other:?}"),
+        ensure!(!tree.put(&mut pager, &key(i), &VALUE)?, "key {i} existed");
+        inserted.push(i);
+        if height(&pager, root)? == 3 {
+            break;
         }
     }
-    bail!("the root never filled up")
+    ensure!(height(&pager, root)? == 3, "the root never split");
+    ensure!(tree.root() == root, "the root page id changed");
+    check_standard(&pager, tree, &inserted)?;
+    ensure_missing(get(tree, &pager, &key(999_999))?.as_deref(), "absent key")?;
+    // A put that needs no split still works.
+    ensure!(tree.put(&mut pager, &key(0), b"x")?, "replace failed");
+    Ok(())
 }
 
 #[test]
@@ -436,22 +424,12 @@ fn run_model(ops: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     for (step, (key, value)) in ops.iter().enumerate() {
-        let before = file_bytes(&path)?;
-        match tree.put(&mut pager, key, value) {
-            Ok(replaced) => {
-                let expected = model.insert(key.clone(), value.clone()).is_some();
-                ensure!(
-                    replaced == expected,
-                    "put {key:?}: tree {replaced}, model {expected}"
-                );
-            }
-            Err(BTreeError::Unsupported { what }) => {
-                ensure!(what == SPLIT_UNSUPPORTED, "what: {what}");
-                ensure!(file_bytes(&path)? == before, "the file changed");
-                break;
-            }
-            Err(other) => bail!("unexpected error: {other:?}"),
-        }
+        let replaced = tree.put(&mut pager, key, value)?;
+        let expected = model.insert(key.clone(), value.clone()).is_some();
+        ensure!(
+            replaced == expected,
+            "put {key:?}: tree {replaced}, model {expected}"
+        );
 
         if step.checked_rem(5) == Some(0) {
             let entries = check_tree(&pager, tree)?;
