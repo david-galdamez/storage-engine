@@ -11,7 +11,8 @@
 //! - a two-level tree: a key equal to a separator goes right, keys below it go
 //!   left, keys above the last separator go to the rightmost child;
 //! - a three-level tree from the bulk loader returns every value;
-//! - an overflow cell gives `Unsupported` (temporary, until step 8);
+//! - an overflow cell with a dangling first page gives a pager error and
+//!   leaves `out` empty (chains are tested in `btree_overflow.rs`);
 //! - corrupt structure: a child that is not a node, a child that points to
 //!   itself (no hang) and a child past the end of the file;
 //! - `get` still works after closing and reopening the file;
@@ -201,7 +202,7 @@ fn three_level_tree_finds_every_key() -> anyhow::Result<()> {
 }
 
 #[test]
-fn overflow_cell_is_unsupported() -> anyhow::Result<()> {
+fn overflow_cell_with_a_dangling_page_is_a_pager_error() -> anyhow::Result<()> {
     let (_dir, path) = temp_db()?;
     let mut pager = new_pager(&path)?;
     let id = pager.allocate_page()?;
@@ -218,14 +219,28 @@ fn overflow_cell_is_unsupported() -> anyhow::Result<()> {
     pager.write_page(id, &mut buf)?;
     let tree = BTree::open(&pager, id)?;
 
-    match get_err(tree, &pager, b"big")? {
-        BTreeError::Unsupported { what } => {
-            ensure!(what == "overflow values (Phase 2, step 8)", "what: {what}");
+    let mut out = b"old".to_vec();
+    match get_err_into(tree, &pager, b"big", &mut out)? {
+        BTreeError::Pager(PagerError::PageOutOfBounds { page, .. }) => {
+            ensure!(page == PageId::new(99), "wrong page: {page}");
         }
-        other => bail!("expected Unsupported, got {other:?}"),
+        other => bail!("expected a pager error, got {other:?}"),
     }
+    ensure!(out.is_empty(), "out should be empty after a failed read");
     // A miss does not touch the overflow cell.
     ensure_missing(get(tree, &pager, b"small")?.as_deref(), "other key")
+}
+
+fn get_err_into(
+    tree: BTree,
+    pager: &Pager,
+    key: &[u8],
+    out: &mut Vec<u8>,
+) -> anyhow::Result<BTreeError> {
+    match tree.get(pager, key, out) {
+        Ok(found) => bail!("get should fail, returned {found}"),
+        Err(e) => Ok(e),
+    }
 }
 
 fn ensure_corrupt_tree(err: &BTreeError, page: PageId, reason: &str) -> anyhow::Result<()> {

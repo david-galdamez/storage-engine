@@ -12,8 +12,10 @@
 //! This step has [`BTree::create`], [`BTree::open`], [`BTree::get`] and
 //! [`BTree::put`]. `put` splits a full leaf and propagates the split up through
 //! the breadcrumbs of the descent: a full parent splits too, at any height,
-//! and a split root keeps its page id. Overflow values, delete and scans come
-//! in later steps (see the Phase 2 roadmap).
+//! and a split root keeps its page id. A value that does not fit inline goes
+//! to a chain of overflow pages (see [`crate::storage::btree::overflow`]), and
+//! `get` reads it back. Delete and scans come in later steps (see the Phase 2
+//! roadmap).
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -25,6 +27,7 @@ use crate::storage::btree::{
     node::{
         INTERNAL_CELL_HEADER_SIZE, LeafCell, ValueRef, fits_inline, leaf_cell_len, max_key_len,
     },
+    overflow::{free_chain, read_value, write_chain},
 };
 use crate::storage::pager::{
     disk::Pager,
@@ -229,8 +232,9 @@ impl BTree {
     }
 
     /// Looks up `key`. If it is found, clears `out`, appends the value to it
-    /// and returns `true`. If it is not found, returns `false` and leaves
-    /// `out` untouched.
+    /// (reading the overflow chain if the value is out of line) and returns
+    /// `true`. If it is not found, returns `false` and leaves `out` untouched.
+    /// If reading an overflow chain fails, `out` is left empty.
     ///
     /// The descent follows ADR 0005, invariant 4, and reuses one page buffer
     /// for all levels.
@@ -242,8 +246,10 @@ impl BTree {
     /// - [`BTreeError::Node`] if a node on the path does not decode.
     /// - [`BTreeError::CorruptTree`] if the root or a child is not a B+Tree
     ///   node, or the descent is deeper than the maximum height.
-    /// - [`BTreeError::Unsupported`] if the value is stored in overflow pages
-    ///   (temporary, until Phase 2 step 8).
+    /// - The errors of [`read_value`] if the value is in an overflow chain
+    ///   that is corrupt: [`BTreeError::CorruptTree`] for a bad chain
+    ///   structure, [`BTreeError::Node`] for an overflow page that does not
+    ///   decode.
     pub fn get(self, pager: &Pager, key: &[u8], out: &mut Vec<u8>) -> Result<bool, BTreeError> {
         let mut buffer = page_buffer(pager);
         // `get` does not need the breadcrumbs.
@@ -259,16 +265,10 @@ impl BTree {
             return Ok(false);
         };
 
-        match leaf.cell(index).map_err(node_error)?.value {
-            ValueRef::Inline(value) => {
-                out.clear();
-                out.extend_from_slice(value);
-                Ok(true)
-            }
-            ValueRef::Overflow { .. } => Err(BTreeError::Unsupported {
-                what: "overflow values (Phase 2, step 8)",
-            }),
-        }
+        let value = leaf.cell(index).map_err(node_error)?.value;
+        out.clear();
+        read_value(pager, value, out)?;
+        Ok(true)
     }
 
     /// Inserts `key` with `value`, or replaces the value if `key` exists
@@ -285,6 +285,15 @@ impl BTree {
     /// root page id, and the tree grows one level. `put` never fails because a
     /// node is full.
     ///
+    /// A value that does not fit inline (`fits_inline` is false) is written
+    /// to a new overflow chain first, and the leaf cell then holds its length
+    /// and first page. If the key already existed with a value in overflow,
+    /// the old chain is freed only after the leaf (and any split pages) were
+    /// written, so a crash can leak pages but never leaves a cell pointing to
+    /// a freed page. Inline to overflow, overflow to inline and overflow to
+    /// overflow all work. If the leaf insert or the split fails after the
+    /// chain was written, the new chain's pages are orphaned (no WAL yet).
+    ///
     /// A split writes several pages and there is no WAL yet (Phase 3). The
     /// whole split is planned in memory first, so an error while planning
     /// writes nothing, but it can leave allocated pages unused. A crash or an
@@ -296,9 +305,8 @@ impl BTree {
     /// # Errors
     ///
     /// - [`BTreeError::KeyTooLarge`] if `key` is longer than `max_key_len`.
-    /// - [`BTreeError::Unsupported`] if the value does not fit inline
-    ///   (overflow values, Phase 2 step 8) or if the old value is in overflow
-    ///   pages. In both cases the file is unchanged.
+    /// - [`BTreeError::ValueTooLarge`] if `value` is longer than `u32::MAX`
+    ///   bytes. Nothing is read or written.
     /// - [`BTreeError::Pager`] if a read, an allocation or a write fails or a
     ///   checksum is wrong. If this happens during a split, pages may already
     ///   be allocated or written.
@@ -306,7 +314,9 @@ impl BTree {
     /// - [`BTreeError::CorruptTree`] if the root or a child is not a B+Tree
     ///   node, the descent is deeper than the maximum height, a node that
     ///   must split has too few entries, or a parent does not lead to the
-    ///   child it was reached through.
+    ///   child it was reached through, or the old overflow chain is corrupt
+    ///   (checked while freeing it, after the new value was written, so the
+    ///   put took effect and the pages before the bad one are freed).
     pub fn put(self, pager: &mut Pager, key: &[u8], value: &[u8]) -> Result<bool, BTreeError> {
         let page_size = pager.page_size();
 
@@ -317,11 +327,7 @@ impl BTree {
                 max,
             });
         }
-        if !fits_inline(page_size, key.len(), value.len()) {
-            return Err(BTreeError::Unsupported {
-                what: "overflow values (Phase 2, step 8)",
-            });
-        }
+        let value_len = value_len_u32(value.len())?;
 
         let mut buffer = page_buffer(pager);
         let mut path = Path::new(self.root);
@@ -334,27 +340,36 @@ impl BTree {
         // The read view's borrow of `buffer` ends after its last use, so the
         // mutable view below can take the buffer afterwards.
         let leaf = LeafNode::new(&buffer).map_err(node_error)?;
-        let (index, replaced) = match leaf.search(key).map_err(node_error)? {
+        let (index, replaced, old_chain) = match leaf.search(key).map_err(node_error)? {
             Ok(index) => {
-                let old = leaf.cell(index).map_err(node_error)?;
-                if matches!(old.value, ValueRef::Overflow { .. }) {
-                    return Err(BTreeError::Unsupported {
-                        what: "replacing overflow values (Phase 2, step 8)",
-                    });
-                }
-                (index, true)
+                let old_chain = match leaf.cell(index).map_err(node_error)?.value {
+                    ValueRef::Overflow { len, first_page } => Some((len, first_page)),
+                    ValueRef::Inline(_) => None,
+                };
+                (index, true, old_chain)
             }
-            Err(index) => (index, false),
+            Err(index) => (index, false, None),
+        };
+
+        // The new chain is written before the leaf that points to it. The
+        // old chain, if any, is freed only after the leaf was written.
+        let value = if fits_inline(page_size, key.len(), value.len()) {
+            ValueRef::Inline(value)
+        } else {
+            ValueRef::Overflow {
+                len: value_len,
+                first_page: write_chain(pager, value)?,
+            }
         };
 
         let mut leaf = LeafNodeMut::new(&mut buffer).map_err(node_error)?;
         if replaced {
             leaf.remove(index).map_err(node_error)?;
         }
-        let value = ValueRef::Inline(value);
         match leaf.insert(index, key, value) {
             Ok(()) => {
                 pager.write_page(leaf_id, &mut buffer)?;
+                free_old_chain(pager, old_chain)?;
                 return Ok(replaced);
             }
             // The leaf is full: split it below. For a replace, the old cell
@@ -370,6 +385,7 @@ impl BTree {
             value,
         };
         split_leaf(pager, &path, leaf_id, buffer, insertion)?;
+        free_old_chain(pager, old_chain)?;
 
         Ok(replaced)
     }
@@ -438,9 +454,30 @@ impl BTree {
     }
 }
 
+/// Converts a value length to the `u32` a leaf cell stores.
+///
+/// # Errors
+///
+/// Returns [`BTreeError::ValueTooLarge`] if `len` is more than `u32::MAX`.
+fn value_len_u32(len: usize) -> Result<u32, BTreeError> {
+    u32::try_from(len).map_err(|_| BTreeError::ValueTooLarge {
+        len,
+        max: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
+    })
+}
+
+/// Frees the chain of the value that `put` replaced, if it was in overflow.
+/// Called only after the new leaf (and any split pages) were written.
+fn free_old_chain(pager: &mut Pager, old_chain: Option<(u32, PageId)>) -> Result<(), BTreeError> {
+    match old_chain {
+        Some((len, first_page)) => free_chain(pager, len, first_page),
+        None => Ok(()),
+    }
+}
+
 /// Allocates a zeroed buffer of one page, owned by the caller (ADR 0005,
 /// option 7, until the buffer pool exists).
-fn page_buffer(pager: &Pager) -> Vec<u8> {
+pub(crate) fn page_buffer(pager: &Pager) -> Vec<u8> {
     vec![0u8; pager.page_size().as_usize()]
 }
 
@@ -971,4 +1008,28 @@ fn fill_internal(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_len_accepts_up_to_u32_max() {
+        assert_eq!(value_len_u32(0).ok(), Some(0));
+        assert_eq!(
+            value_len_u32(usize::try_from(u32::MAX).unwrap_or(0)).ok(),
+            Some(u32::MAX)
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn value_len_rejects_more_than_u32_max() {
+        let len = usize::try_from(u64::from(u32::MAX).saturating_add(1)).unwrap_or(usize::MAX);
+        assert!(matches!(
+            value_len_u32(len),
+            Err(BTreeError::ValueTooLarge { len: l, max }) if l == len && max == 4_294_967_295
+        ));
+    }
 }

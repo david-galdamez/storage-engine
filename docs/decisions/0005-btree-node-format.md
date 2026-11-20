@@ -270,6 +270,10 @@ there is no migration.
    `next_leaf` from the leftmost leaf visits every leaf exactly once.
 7. Every overflow page belongs to exactly one leaf cell. Removing or replacing
    the cell frees its whole chain.
+   A chain is written before the leaf that points to it, and when a value is
+   replaced the old chain is freed only after the leaf was written. A crash
+   can leak pages but never leaves a cell pointing to a freed page (until the
+   WAL, Phase 3).
 8. Until rebalancing (Phase 2, step 11), deletes can leave empty leaves. They
    stay linked, and cursors skip them. Internal nodes always have at least
    one cell, except for the moment inside a root collapse.

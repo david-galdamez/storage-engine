@@ -65,10 +65,10 @@ pub enum BTreeError {
     #[error("Key too large, len: {len} - max: {max}")]
     KeyTooLarge { len: usize, max: usize },
 
-    /// The operation needs a feature that is not implemented yet: overflow
-    /// chains (Phase 2, step 8). Temporary: removed when they exist. The
-    /// operation changes nothing in the file.
-    /// Field `what` names the missing feature.
-    #[error("Unsupported: {what}")]
-    Unsupported { what: &'static str },
+    /// `put` was given a value longer than `u32::MAX` bytes, the largest
+    /// length a leaf cell can store. This is a caller error, not corruption:
+    /// nothing was read or written. Field `len` is the rejected length; field
+    /// `max` is the limit.
+    #[error("Value too large, len: {len} - max: {max}")]
+    ValueTooLarge { len: usize, max: usize },
 }

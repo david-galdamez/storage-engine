@@ -382,7 +382,7 @@ fn full_parent_splits_instead_of_failing() -> anyhow::Result<()> {
     let root = tree.root();
 
     // Insert until the tree has three levels: the first full parent is the
-    // root, and its split used to give `Unsupported`.
+    // root, and its split used to fail.
     let mut inserted = Vec::new();
     for i in 0..2000usize {
         ensure!(!tree.put(&mut pager, &key(i), &VALUE)?, "key {i} existed");

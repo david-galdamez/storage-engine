@@ -10,13 +10,13 @@
 //! - a put into an empty tree, and replaces with larger, smaller and empty
 //!   values (the cell count does not change);
 //! - the empty key, the largest inline value and the largest key, and the
-//!   errors one byte past each limit (`Unsupported`, `KeyTooLarge`), with the
+//!   one byte past each limit (first overflow value, `KeyTooLarge`), with the
 //!   file unchanged;
 //! - keys inserted in random order end up in ascending order;
 //! - a put into a full leaf splits it and every key is kept;
 //! - many replaces of one key reclaim fragmented space (compaction);
 //! - a put into a three-level tree routes the key to the right leaf;
-//! - replacing an overflow value gives `Unsupported`, nothing is written;
+//! - replacing a value that is in overflow frees its chain;
 //! - `put` survives closing and reopening the file;
 //! - a property test against a `BTreeMap` model.
 
@@ -36,6 +36,7 @@ use storage_engine_rs::storage::btree::error::BTreeError;
 use storage_engine_rs::storage::btree::internal::InternalNode;
 use storage_engine_rs::storage::btree::leaf::{LeafNode, LeafNodeMut};
 use storage_engine_rs::storage::btree::node::{ValueRef, max_key_len, max_node_cell_len};
+use storage_engine_rs::storage::btree::overflow::OverflowPageMut;
 use storage_engine_rs::storage::pager::disk::Pager;
 use storage_engine_rs::storage::pager::types::PageId;
 
@@ -81,16 +82,6 @@ fn put_err(tree: BTree, pager: &mut Pager, key: &[u8], value: &[u8]) -> anyhow::
     match tree.put(pager, key, value) {
         Ok(replaced) => bail!("put should fail, returned {replaced}"),
         Err(e) => Ok(e),
-    }
-}
-
-fn ensure_unsupported(err: &BTreeError, prefix: &str) -> anyhow::Result<()> {
-    match err {
-        BTreeError::Unsupported { what } => {
-            ensure!(what.starts_with(prefix), "what: {what}");
-            Ok(())
-        }
-        other => bail!("expected Unsupported, got {other:?}"),
     }
 }
 
@@ -174,13 +165,19 @@ fn value_at_the_inline_maximum_and_one_more() -> anyhow::Result<()> {
     ensure!(!tree.put(&mut pager, key, &value)?, "max inline put");
     ensure_value(get(tree, &pager, key)?.as_deref(), &value, "max inline")?;
 
-    let before = file_bytes(&path)?;
+    // One byte more goes to an overflow chain, for a replace and for a new key.
     let too_big = vec![0xCD; max_value.checked_add(1).context("overflow")?];
-    let err = put_err(tree, &mut pager, key, &too_big)?;
-    ensure_unsupported(&err, "overflow values")?;
-    let err = put_err(tree, &mut pager, b"other", &too_big)?;
-    ensure_unsupported(&err, "overflow values")?;
-    ensure!(file_bytes(&path)? == before, "file changed by a failed put");
+    ensure!(tree.put(&mut pager, key, &too_big)?, "overflow replace");
+    ensure_value(
+        get(tree, &pager, key)?.as_deref(),
+        &too_big,
+        "overflow value",
+    )?;
+    ensure!(
+        !tree.put(&mut pager, b"other", &too_big)?,
+        "overflow insert"
+    );
+    ensure_value(get(tree, &pager, b"other")?.as_deref(), &too_big, "other")?;
     Ok(())
 }
 
@@ -373,30 +370,34 @@ fn put_routes_keys_in_a_three_level_tree() -> anyhow::Result<()> {
 }
 
 #[test]
-fn replacing_an_overflow_value_is_unsupported() -> anyhow::Result<()> {
+fn replacing_a_hand_built_overflow_value_frees_its_chain() -> anyhow::Result<()> {
     let (_dir, path) = temp_db()?;
     let mut pager = new_pager(&path)?;
     let id = write_leaf(&mut pager, &[(b"a", b"A")], None)?;
+    let chain = pager.allocate_page()?;
+    let mut page = blank();
+    OverflowPageMut::init(&mut page, None, &[7u8; 100])?;
+    pager.write_page(chain, &mut page)?;
     let mut buf = read(&pager, id)?;
     LeafNodeMut::new(&mut buf)?.insert(
         1,
         b"big",
         ValueRef::Overflow {
-            len: 5000,
-            first_page: PageId::new(99),
+            len: 100,
+            first_page: chain,
         },
     )?;
     pager.write_page(id, &mut buf)?;
     let tree = BTree::open(&pager, id)?;
-    let before = file_bytes(&path)?;
+    ensure_value(
+        get(tree, &pager, b"big")?.as_deref(),
+        &[7u8; 100],
+        "old value",
+    )?;
 
-    let err = put_err(tree, &mut pager, b"big", b"small")?;
-    ensure_unsupported(&err, "replacing overflow")?;
-    ensure!(file_bytes(&path)? == before, "file changed by a failed put");
-
-    // The other cells still accept puts.
-    ensure!(tree.put(&mut pager, b"a", b"A2")?, "replace a");
-    ensure!(!tree.put(&mut pager, b"b", b"B")?, "insert b");
+    ensure!(tree.put(&mut pager, b"big", b"small")?, "replace big");
+    ensure!(pager.free_page_count() == 1, "the old chain was not freed");
+    ensure_value(get(tree, &pager, b"big")?.as_deref(), b"small", "new value")?;
     Ok(())
 }
 

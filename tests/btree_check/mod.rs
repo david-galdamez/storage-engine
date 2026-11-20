@@ -9,16 +9,25 @@
 //!   (invariant 4), passing the bounds down;
 //! - the `next_leaf` chain visits the leaves in the same order as the walk,
 //!   and the last leaf has no next leaf (invariant 6);
-//! - the keys are strictly ascending across the whole tree (invariant 3).
+//! - the keys are strictly ascending across the whole tree (invariant 3);
+//! - every overflow cell has a chain of the right structure and total length,
+//!   and no page is used twice, by two chains or by a chain and a node
+//!   (invariant 7). The entries returned hold the full values.
+//!
+//! `check_tree_pages` also returns the number of node pages and of overflow
+//! pages of the tree, for the page accounting of the overflow tests.
 //!
 //! Each test binary that includes this module with `mod btree_check;` must use
 //! every item, or `dead_code` fires.
 
-use anyhow::{Context, bail, ensure};
+use std::collections::HashSet;
+
+use anyhow::{Context, ensure};
 use storage_engine_rs::storage::btree::BTree;
 use storage_engine_rs::storage::btree::internal::InternalNode;
 use storage_engine_rs::storage::btree::leaf::LeafNode;
 use storage_engine_rs::storage::btree::node::ValueRef;
+use storage_engine_rs::storage::btree::overflow::{OverflowPage, overflow_capacity};
 use storage_engine_rs::storage::pager::disk::Pager;
 use storage_engine_rs::storage::pager::types::PageId;
 
@@ -35,6 +44,52 @@ struct Walk {
     /// Each leaf in walk order (left to right) with its `next_leaf`.
     leaves: Vec<(PageId, Option<PageId>)>,
     entries: Entries,
+    /// Every node page visited.
+    node_pages: HashSet<PageId>,
+    /// Every overflow page visited.
+    overflow_pages: HashSet<PageId>,
+}
+
+/// Reads the chain of `len` bytes at `first`, checking its structure, and
+/// returns the value. Records every page in `walk.overflow_pages`.
+fn read_chain(pager: &Pager, len: u32, first: PageId, walk: &mut Walk) -> anyhow::Result<Vec<u8>> {
+    let capacity = overflow_capacity(pager.page_size());
+    let total = usize::try_from(len)?;
+    ensure!(total > 0, "chain at {first}: overflow value of length 0");
+    let mut value = Vec::new();
+    let mut current = Some(first);
+    while let Some(id) = current {
+        ensure!(
+            walk.overflow_pages.insert(id),
+            "overflow page {id} is used twice"
+        );
+        ensure!(
+            !walk.node_pages.contains(&id),
+            "overflow page {id} is also a node"
+        );
+        let buf = read(pager, id)?;
+        let page = OverflowPage::new(&buf).with_context(|| format!("overflow {id}"))?;
+        page.validate().with_context(|| format!("overflow {id}"))?;
+        let data = page.data()?;
+        current = page.next()?;
+        if current.is_some() {
+            ensure!(
+                data.len() == capacity,
+                "overflow {id}: not full but not last"
+            );
+        }
+        value.extend_from_slice(data);
+        ensure!(
+            value.len() <= total,
+            "chain at {first} is longer than {total}"
+        );
+    }
+    ensure!(
+        value.len() == total,
+        "chain at {first} has {} bytes, the cell says {total}",
+        value.len()
+    );
+    Ok(value)
 }
 
 fn read(pager: &Pager, id: PageId) -> anyhow::Result<Vec<u8>> {
@@ -58,6 +113,11 @@ fn visit(
 ) -> anyhow::Result<()> {
     ensure!(depth < MAX_DEPTH, "page {id}: tree is too deep");
     let buf = read(pager, id)?;
+    ensure!(walk.node_pages.insert(id), "node page {id} is used twice");
+    ensure!(
+        !walk.overflow_pages.contains(&id),
+        "node {id} is also an overflow page"
+    );
 
     if let Ok(node) = InternalNode::new(&buf) {
         node.validate().with_context(|| format!("internal {id}"))?;
@@ -108,7 +168,10 @@ fn visit(
         );
         match cell.value {
             ValueRef::Inline(value) => walk.entries.push((cell.key.to_vec(), value.to_vec())),
-            ValueRef::Overflow { .. } => bail!("leaf {id}: unexpected overflow cell"),
+            ValueRef::Overflow { len, first_page } => {
+                let value = read_chain(pager, len, first_page, walk)?;
+                walk.entries.push((cell.key.to_vec(), value));
+            }
         }
     }
     walk.leaves.push((id, leaf.next_leaf()?));
@@ -118,10 +181,18 @@ fn visit(
 /// Checks the whole tree (see the module doc) and returns all its entries in
 /// key order.
 pub fn check_tree(pager: &Pager, tree: BTree) -> anyhow::Result<Entries> {
+    Ok(check_tree_pages(pager, tree)?.0)
+}
+
+/// Like `check_tree`, and also returns the number of node pages and the number
+/// of overflow pages of the tree: `(entries, node_pages, overflow_pages)`.
+pub fn check_tree_pages(pager: &Pager, tree: BTree) -> anyhow::Result<(Entries, usize, usize)> {
     let mut walk = Walk {
         leaf_depth: None,
         leaves: Vec::new(),
         entries: Vec::new(),
+        node_pages: HashSet::new(),
+        overflow_pages: HashSet::new(),
     };
     visit(pager, tree.root(), None, None, 0, &mut walk)?;
 
@@ -142,7 +213,11 @@ pub fn check_tree(pager: &Pager, tree: BTree) -> anyhow::Result<Entries> {
         walk.entries.windows(2).all(|w| w.first() < w.get(1)),
         "keys are not strictly ascending across the tree"
     );
-    Ok(walk.entries)
+    Ok((
+        walk.entries,
+        walk.node_pages.len(),
+        walk.overflow_pages.len(),
+    ))
 }
 
 /// The leaves in order, found the way a forward scan would: down the leftmost
