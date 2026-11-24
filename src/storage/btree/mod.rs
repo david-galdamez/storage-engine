@@ -3,10 +3,10 @@
 //! The node format is described in ADR 0005
 //! (`docs/decisions/0005-btree-node-format.md`). This module has the node
 //! level (borrowed read and write views of one leaf or internal node, and the
-//! cell encodings) and the tree handle with lookup, insert and leaf splits.
-//! Overflow chains for large values live in [`overflow`](self::overflow), and
-//! ordered range scans in [`cursor`](self::cursor). Delete comes in a later
-//! step.
+//! cell encodings) and the tree handle with lookup, insert, delete and leaf
+//! splits. Overflow chains for large values live in
+//! [`overflow`](self::overflow), and ordered range scans in
+//! [`cursor`](self::cursor). Delete does not rebalance yet (a later step).
 //!
 //! - [`node`](self::node): size limits, [`node::ValueRef`] and the leaf cell codec.
 //! - [`leaf`](self::leaf): [`leaf::LeafNode`] and [`leaf::LeafNodeMut`].

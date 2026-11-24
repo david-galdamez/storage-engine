@@ -10,13 +10,14 @@
 //! one pager, and the borrow checker keeps writes and reads apart.
 //!
 //! This step has [`BTree::create`], [`BTree::open`], [`BTree::get`],
-//! [`BTree::put`] and (in [`cursor`](crate::storage::btree::cursor))
-//! [`BTree::range`]. `put` splits a full leaf and propagates the split up through
+//! [`BTree::put`], [`BTree::delete`] and (in
+//! [`cursor`](crate::storage::btree::cursor)) [`BTree::range`]. `put` splits a full leaf and propagates the split up through
 //! the breadcrumbs of the descent: a full parent splits too, at any height,
 //! and a split root keeps its page id. A value that does not fit inline goes
 //! to a chain of overflow pages (see [`crate::storage::btree::overflow`]), and
-//! `get` reads it back. Delete comes in a later step (see the Phase 2
-//! roadmap). The descent is shared: `descend` finds the leaf for a key or the
+//! `get` reads it back. `delete` removes a cell and frees its chain, without
+//! rebalancing: leaves can become empty and stay linked (ADR 0005, invariant
+//! 8). The descent is shared: `descend` finds the leaf for a key or the
 //! first or last leaf of the tree, and the range cursor reuses it to seek.
 
 use std::cmp::Ordering;
@@ -369,10 +370,7 @@ impl BTree {
         let leaf = LeafNode::new(&buffer).map_err(node_error)?;
         let (index, replaced, old_chain) = match leaf.search(key).map_err(node_error)? {
             Ok(index) => {
-                let old_chain = match leaf.cell(index).map_err(node_error)?.value {
-                    ValueRef::Overflow { len, first_page } => Some((len, first_page)),
-                    ValueRef::Inline(_) => None,
-                };
+                let old_chain = overflow_chain(leaf.cell(index).map_err(node_error)?.value);
                 (index, true, old_chain)
             }
             Err(index) => (index, false, None),
@@ -415,6 +413,78 @@ impl BTree {
         free_old_chain(pager, old_chain)?;
 
         Ok(replaced)
+    }
+
+    /// Removes `key`. Returns `true` if the key existed and was removed, and
+    /// `false` if it was missing (nothing is written then). A key longer than
+    /// `max_key_len` cannot be in the tree, so it returns `false` like
+    /// [`BTree::get`]. The old value is not returned: call `get` first if it
+    /// is needed.
+    ///
+    /// The descent is the one of [`BTree::get`]. The cell is removed in the
+    /// leaf's page buffer and the page is written once. If the value was in an
+    /// overflow chain, the chain is freed only after the leaf was written, so a
+    /// crash can leak pages but never leaves a cell pointing to a freed page
+    /// (ADR 0005, invariant 7).
+    ///
+    /// There is no rebalancing yet (Phase 2, step 11): the leaf is not
+    /// compacted, an empty leaf stays in the tree with its `next_leaf`, and
+    /// internal nodes are never touched (ADR 0005, invariant 8). Does not sync.
+    ///
+    /// Like `put`, `delete` needs `&mut Pager`, so it cannot run while a
+    /// [`Cursor`](crate::storage::btree::cursor::Cursor) is alive:
+    ///
+    /// ```compile_fail,E0502
+    /// # use std::ops::Bound;
+    /// # use storage_engine_rs::storage::btree::{BTree, Direction, error::BTreeError};
+    /// # use storage_engine_rs::storage::pager::disk::Pager;
+    /// fn demo(tree: BTree, pager: &mut Pager) -> Result<(), BTreeError> {
+    ///     let mut cursor =
+    ///         tree.range(pager, Bound::Unbounded, Bound::Unbounded, Direction::Forward)?;
+    ///     tree.delete(pager, b"key")?;
+    ///     cursor.next_entry()?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// - [`BTreeError::Pager`] if a read or a write fails or a checksum is
+    ///   wrong.
+    /// - [`BTreeError::Node`] if a node on the path does not decode.
+    /// - [`BTreeError::CorruptTree`] if the root or a child is not a B+Tree
+    ///   node, the descent is deeper than the maximum height, or the old
+    ///   overflow chain is corrupt (checked while freeing it, after the leaf
+    ///   was written, so the key is already deleted and the pages before the
+    ///   bad one are freed).
+    pub fn delete(self, pager: &mut Pager, key: &[u8]) -> Result<bool, BTreeError> {
+        if key.len() > max_key_len(pager.page_size()) {
+            return Ok(false);
+        }
+
+        let mut buffer = page_buffer(pager);
+        // The path is not used until rebalancing (step 11).
+        let mut path = Path::new(self.root);
+        let leaf_id = self.descend(pager, Target::Key(key), &mut buffer, &mut path)?;
+
+        let node_error = |source| BTreeError::Node {
+            page: leaf_id,
+            source,
+        };
+        let leaf = LeafNode::new(&buffer).map_err(node_error)?;
+        let Ok(index) = leaf.search(key).map_err(node_error)? else {
+            return Ok(false);
+        };
+        let old_chain = overflow_chain(leaf.cell(index).map_err(node_error)?.value);
+
+        LeafNodeMut::new(&mut buffer)
+            .map_err(node_error)?
+            .remove(index)
+            .map_err(node_error)?;
+        pager.write_page(leaf_id, &mut buffer)?;
+        free_old_chain(pager, old_chain)?;
+
+        Ok(true)
     }
 
     /// Descends from the root to the leaf chosen by `target`: the leaf whose
@@ -500,8 +570,18 @@ fn value_len_u32(len: usize) -> Result<u32, BTreeError> {
     })
 }
 
-/// Frees the chain of the value that `put` replaced, if it was in overflow.
-/// Called only after the new leaf (and any split pages) were written.
+/// The length and first page of the chain of `value`, or `None` if the value
+/// is inline.
+const fn overflow_chain(value: ValueRef<'_>) -> Option<(u32, PageId)> {
+    match value {
+        ValueRef::Overflow { len, first_page } => Some((len, first_page)),
+        ValueRef::Inline(_) => None,
+    }
+}
+
+/// Frees the chain of the value that `put` replaced or `delete` removed, if it
+/// was in overflow. Called only after the new leaf (and any split pages) were
+/// written.
 fn free_old_chain(pager: &mut Pager, old_chain: Option<(u32, PageId)>) -> Result<(), BTreeError> {
     match old_chain {
         Some((len, first_page)) => free_chain(pager, len, first_page),
@@ -1047,6 +1127,20 @@ fn fill_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflow_chain_of_an_inline_value_is_none() {
+        assert_eq!(overflow_chain(ValueRef::Inline(b"abc")), None);
+    }
+
+    #[test]
+    fn overflow_chain_of_an_overflow_value_is_its_length_and_first_page() {
+        let value = ValueRef::Overflow {
+            len: 700,
+            first_page: PageId::new(5),
+        };
+        assert_eq!(overflow_chain(value), Some((700, PageId::new(5))));
+    }
 
     #[test]
     fn value_len_accepts_up_to_u32_max() {

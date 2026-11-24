@@ -273,7 +273,8 @@ there is no migration.
    A chain is written before the leaf that points to it, and when a value is
    replaced the old chain is freed only after the leaf was written. A crash
    can leak pages but never leaves a cell pointing to a freed page (until the
-   WAL, Phase 3).
+   WAL, Phase 3). Delete follows the same order: it writes the leaf without
+   the cell before it frees the chain.
 8. Until rebalancing (Phase 2, step 11), deletes can leave empty leaves. They
    stay linked, and cursors skip them. Internal nodes always have at least
    one cell, except for the moment inside a root collapse.
