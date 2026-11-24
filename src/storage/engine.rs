@@ -3,7 +3,9 @@
 //! This is a draft. It is engine-agnostic: the B+Tree engine will implement it
 //! once `get`, `put` and `delete` exist (after Phase 2 step 10), and another
 //! engine, such as an LSM tree, could implement it later. No type implements
-//! it yet. `scan`, with a lending cursor, is added in Phase 2 step 9.
+//! it yet. `scan` is deferred until the trait is implemented, after Phase 2
+//! step 10: the B+Tree already has a lending cursor (`BTree::range`), which
+//! `scan` will wrap.
 //!
 //! The unit of work is a tree (keyspace): a model's primary data or one
 //! secondary index. Keys are unique byte strings compared in `memcmp` order.

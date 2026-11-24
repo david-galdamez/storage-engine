@@ -9,13 +9,15 @@
 //! argument: `&Pager` for reads and `&mut Pager` for writes. Many trees share
 //! one pager, and the borrow checker keeps writes and reads apart.
 //!
-//! This step has [`BTree::create`], [`BTree::open`], [`BTree::get`] and
-//! [`BTree::put`]. `put` splits a full leaf and propagates the split up through
+//! This step has [`BTree::create`], [`BTree::open`], [`BTree::get`],
+//! [`BTree::put`] and (in [`cursor`](crate::storage::btree::cursor))
+//! [`BTree::range`]. `put` splits a full leaf and propagates the split up through
 //! the breadcrumbs of the descent: a full parent splits too, at any height,
 //! and a split root keeps its page id. A value that does not fit inline goes
 //! to a chain of overflow pages (see [`crate::storage::btree::overflow`]), and
-//! `get` reads it back. Delete and scans come in later steps (see the Phase 2
-//! roadmap).
+//! `get` reads it back. Delete comes in a later step (see the Phase 2
+//! roadmap). The descent is shared: `descend` finds the leaf for a key or the
+//! first or last leaf of the tree, and the range cursor reuses it to seek.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -44,38 +46,38 @@ use crate::storage::pager::{
 /// `2^(h-1)` leaves. Page ids are `u32`, so a file has fewer than `2^32`
 /// pages and `h - 1 <= 32`, which gives `h <= 33`. A longer descent can only
 /// be a corrupt file, for example a child pointing back up the tree.
-const MAX_TREE_HEIGHT: usize = 33;
+pub(super) const MAX_TREE_HEIGHT: usize = 33;
 
 /// One step of a descent: an internal node and the child position taken in it.
 #[derive(Debug, Clone, Copy)]
-struct Crumb {
+pub(super) struct Crumb {
     /// The internal node that was visited.
-    page: PageId,
+    pub(super) page: PageId,
     /// The child position taken in it, in `0..=N` (see
     /// [`InternalNode::child_for`]).
-    pos: usize,
+    pub(super) pos: usize,
     /// `true` if the descent took the rightmost child (`pos == N`).
-    last: bool,
+    pub(super) last: bool,
 }
 
 /// The breadcrumbs of a descent: the internal nodes from the root down to the
 /// parent of the leaf, with the child position taken in each (*Database
 /// Internals*, ch. 4, Breadcrumbs).
 ///
-/// It is filled by `BTree::find_leaf` and has no heap allocation: a fixed array
+/// It is filled by `BTree::descend` and has no heap allocation: a fixed array
 /// of [`MAX_TREE_HEIGHT`] crumbs is enough, because a descent never visits
 /// more levels. The path is empty when the root is the leaf. A leaf split reads
 /// the crumbs from the bottom up to find the parent that receives the
 /// separator, and the grandparent and above if the split propagates.
 #[derive(Debug)]
-struct Path {
+pub(super) struct Path {
     crumbs: [Crumb; MAX_TREE_HEIGHT],
     len: usize,
 }
 
 impl Path {
     /// Creates an empty path. `filler` only fills the unused array slots.
-    const fn new(filler: PageId) -> Self {
+    pub(super) const fn new(filler: PageId) -> Self {
         Self {
             crumbs: [Crumb {
                 page: filler,
@@ -87,12 +89,12 @@ impl Path {
     }
 
     /// Removes all the crumbs.
-    const fn clear(&mut self) {
+    pub(super) const fn clear(&mut self) {
         self.len = 0;
     }
 
     /// Appends a crumb at the bottom of the path.
-    fn push(&mut self, crumb: Crumb) -> Result<(), BTreeError> {
+    pub(super) fn push(&mut self, crumb: Crumb) -> Result<(), BTreeError> {
         let slot = self
             .crumbs
             .get_mut(self.len)
@@ -106,11 +108,36 @@ impl Path {
         Ok(())
     }
 
+    /// Removes and returns the bottom crumb, or `None` if the path is empty.
+    pub(super) fn pop(&mut self) -> Option<Crumb> {
+        self.len = self.len.checked_sub(1)?;
+
+        self.crumbs.get(self.len).copied()
+    }
+
+    /// Returns the bottom crumb, or `None` if the path is empty.
+    pub(super) fn last_mut(&mut self) -> Option<&mut Crumb> {
+        let bottom = self.len.checked_sub(1)?;
+
+        self.crumbs.get_mut(bottom)
+    }
+
     /// Returns the crumbs from the root down to the parent of the leaf. The
     /// slice is empty when the leaf is the root.
     fn as_slice(&self) -> &[Crumb] {
         self.crumbs.get(..self.len).unwrap_or_default()
     }
+}
+
+/// Where a descent goes (see [`BTree::descend`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Target<'k> {
+    /// The leaf whose subtree can hold this key (ADR 0005, invariant 4).
+    Key(&'k [u8]),
+    /// The leftmost leaf: child position 0 at every level.
+    First,
+    /// The rightmost leaf: child position N at every level.
+    Last,
 }
 
 /// The cell that `put` wants to insert, and where it goes in the leaf.
@@ -254,7 +281,7 @@ impl BTree {
         let mut buffer = page_buffer(pager);
         // `get` does not need the breadcrumbs.
         let mut path = Path::new(self.root);
-        let leaf_id = self.find_leaf(pager, key, &mut buffer, &mut path)?;
+        let leaf_id = self.descend(pager, Target::Key(key), &mut buffer, &mut path)?;
 
         let node_error = |source| BTreeError::Node {
             page: leaf_id,
@@ -331,7 +358,7 @@ impl BTree {
 
         let mut buffer = page_buffer(pager);
         let mut path = Path::new(self.root);
-        let leaf_id = self.find_leaf(pager, key, &mut buffer, &mut path)?;
+        let leaf_id = self.descend(pager, Target::Key(key), &mut buffer, &mut path)?;
 
         let node_error = |source| BTreeError::Node {
             page: leaf_id,
@@ -390,18 +417,18 @@ impl BTree {
         Ok(replaced)
     }
 
-    /// Descends from the root to the leaf whose subtree can hold `key`
-    /// (ADR 0005, invariant 4). Returns the id of the leaf, whose page is left
-    /// in `buffer`. All levels read into the same `buffer`, which must be one
-    /// page long.
+    /// Descends from the root to the leaf chosen by `target`: the leaf whose
+    /// subtree can hold a key (ADR 0005, invariant 4), the first leaf or the
+    /// last leaf. Returns the id of the leaf, whose page is left in `buffer`.
+    /// All levels read into the same `buffer`, which must be one page long.
     ///
     /// `path` is cleared and then receives one crumb for each internal node on
     /// the way down, with the child position taken. It stays empty when the
     /// root is the leaf.
-    fn find_leaf(
+    pub(super) fn descend(
         self,
         pager: &Pager,
-        key: &[u8],
+        target: Target<'_>,
         buffer: &mut [u8],
         path: &mut Path,
     ) -> Result<PageId, BTreeError> {
@@ -419,7 +446,14 @@ impl BTree {
                         source,
                     };
                     let node = InternalNode::new(buffer).map_err(node_error)?;
-                    let (pos, child) = node.child_for(key).map_err(node_error)?;
+                    let (pos, child) = match target {
+                        Target::Key(key) => node.child_for(key).map_err(node_error)?,
+                        Target::First => (0, node.child_at(0).map_err(node_error)?),
+                        Target::Last => {
+                            let last = node.cell_count();
+                            (last, node.child_at(last).map_err(node_error)?)
+                        }
+                    };
                     path.push(Crumb {
                         page: current,
                         pos,
