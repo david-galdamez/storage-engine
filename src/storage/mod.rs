@@ -1,4 +1,5 @@
-//! Storage layer: the in-memory store and the on-disk pager.
+//! Storage layer: the engine trait, the B+Tree engine, the in-memory store and
+//! the on-disk pager.
 
 pub mod btree;
 pub mod engine;

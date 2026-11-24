@@ -14,9 +14,11 @@
 //! - [`overflow`](self::overflow): overflow page views and chain read, write and free.
 //! - [`cursor`](self::cursor): [`cursor::Cursor`] and [`cursor::Direction`], range scans.
 //! - [`tree`](self::tree): [`tree::BTree`], the handle of one tree.
+//! - [`engine`](self::engine): [`engine::BTreeEngine`], the `StorageEngine` implementation.
 //! - [`error`](self::error): [`error::NodeError`] and [`error::BTreeError`].
 
 pub mod cursor;
+pub mod engine;
 pub mod error;
 pub mod internal;
 pub mod leaf;
@@ -25,4 +27,5 @@ pub mod overflow;
 pub mod tree;
 
 pub use cursor::{Cursor, Direction};
+pub use engine::BTreeEngine;
 pub use tree::BTree;
