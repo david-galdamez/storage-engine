@@ -17,7 +17,7 @@ use anyhow::ensure;
 use storage_engine_rs::storage::btree::error::NodeError;
 use storage_engine_rs::storage::btree::node::{
     LeafCell, ValueRef, decode_leaf_cell, fits_inline, leaf_cell_len, max_key_len,
-    max_node_cell_len,
+    max_node_cell_len, min_node_fill, usable_space,
 };
 use storage_engine_rs::storage::pager::types::{PageId, PageSize};
 
@@ -48,6 +48,28 @@ fn limits_match_the_adr_table() -> anyhow::Result<()> {
             "{} max_key",
             page_size.get()
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn min_node_fill_is_a_quarter_of_the_usable_space() -> anyhow::Result<()> {
+    for (page_size, usable, fill) in [(512, 480, 120), (4096, 4064, 1016), (65536, 65504, 16376)] {
+        let page_size = size(page_size)?;
+        ensure!(
+            usable_space(page_size) == usable,
+            "{} usable",
+            page_size.get()
+        );
+        ensure!(min_node_fill(page_size) == fill, "{} fill", page_size.get());
+        // `used * 4 < usable` is the same test as `used < min_node_fill`.
+        for used in [fill.saturating_sub(1), fill] {
+            ensure!(
+                (used.saturating_mul(4) < usable) == (used < fill),
+                "{} used {used}",
+                page_size.get()
+            );
+        }
     }
     Ok(())
 }

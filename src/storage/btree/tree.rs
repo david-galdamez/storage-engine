@@ -15,8 +15,10 @@
 //! the breadcrumbs of the descent: a full parent splits too, at any height,
 //! and a split root keeps its page id. A value that does not fit inline goes
 //! to a chain of overflow pages (see [`crate::storage::btree::overflow`]), and
-//! `get` reads it back. `delete` removes a cell and frees its chain, without
-//! rebalancing: leaves can become empty and stay linked (ADR 0005, invariant
+//! `get` reads it back. `delete` removes a cell and frees its chain, and
+//! rebalances an underfull leaf (the private `rebalance` module):
+//! it can free pages and rewrite the parent. Internal nodes are not
+//! rebalanced yet, so a leaf can stay underfull or empty (ADR 0005, invariant
 //! 8). The descent is shared: `descend` finds the leaf for a key or the
 //! first or last leaf of the tree, and the range cursor reuses it to seek.
 
@@ -31,6 +33,7 @@ use crate::storage::btree::{
         INTERNAL_CELL_HEADER_SIZE, LeafCell, ValueRef, fits_inline, leaf_cell_len, max_key_len,
     },
     overflow::{free_chain, read_value, write_chain},
+    rebalance::rebalance_leaf,
 };
 use crate::storage::pager::{
     disk::Pager,
@@ -125,7 +128,7 @@ impl Path {
 
     /// Returns the crumbs from the root down to the parent of the leaf. The
     /// slice is empty when the leaf is the root.
-    fn as_slice(&self) -> &[Crumb] {
+    pub(super) fn as_slice(&self) -> &[Crumb] {
         self.crumbs.get(..self.len).unwrap_or_default()
     }
 }
@@ -160,7 +163,26 @@ struct Combined<'a> {
     insertion: Insertion<'a>,
 }
 
-impl<'a> Combined<'a> {
+/// A sequence of leaf cells in key order that is not stored in one place: the
+/// cells of a leaf plus a new one ([`Combined`]), or the cells of two sibling
+/// leaves (`LeafPair` in the rebalance module). A split or a redistribution
+/// chooses where to cut it by bytes, without copying the cells.
+pub(super) trait CellSequence {
+    /// Number of entries.
+    fn len(&self) -> usize;
+
+    /// Entry `j` of the sequence, for `j < len`.
+    fn entry(&self, j: usize) -> Result<LeafCell<'_>, NodeError>;
+
+    /// Bytes that entry `j` uses in a page: its cell plus its slot.
+    fn entry_bytes(&self, j: usize) -> Result<usize, NodeError> {
+        let cell = self.entry(j)?;
+
+        Ok(leaf_cell_len(cell.key.len(), &cell.value).saturating_add(SLOT_SIZE))
+    }
+}
+
+impl CellSequence for Combined<'_> {
     /// Number of entries: the cells of the leaf plus the new one.
     fn len(&self) -> usize {
         self.leaf.cell_count().saturating_add(1)
@@ -168,7 +190,7 @@ impl<'a> Combined<'a> {
 
     /// Entry `j` of the combined sequence: `j < index` is leaf cell `j`,
     /// `j == index` is the new cell and `j > index` is leaf cell `j - 1`.
-    fn entry(&self, j: usize) -> Result<LeafCell<'a>, NodeError> {
+    fn entry(&self, j: usize) -> Result<LeafCell<'_>, NodeError> {
         match j.cmp(&self.insertion.index) {
             Ordering::Less => self.leaf.cell(j),
             Ordering::Equal => Ok(LeafCell {
@@ -177,13 +199,6 @@ impl<'a> Combined<'a> {
             }),
             Ordering::Greater => self.leaf.cell(j.saturating_sub(1)),
         }
-    }
-
-    /// Bytes that entry `j` uses in a page: its cell plus its slot.
-    fn entry_bytes(&self, j: usize) -> Result<usize, NodeError> {
-        let cell = self.entry(j)?;
-
-        Ok(leaf_cell_len(cell.key.len(), &cell.value).saturating_add(SLOT_SIZE))
     }
 }
 
@@ -427,9 +442,16 @@ impl BTree {
     /// crash can leak pages but never leaves a cell pointing to a freed page
     /// (ADR 0005, invariant 7).
     ///
-    /// There is no rebalancing yet (Phase 2, step 11): the leaf is not
-    /// compacted, an empty leaf stays in the tree with its `next_leaf`, and
-    /// internal nodes are never touched (ADR 0005, invariant 8). Does not sync.
+    /// If the leaf is not the root and ends up underfull (ADR 0005, amendment
+    /// 3), it is merged into a sibling with the same parent, or the two are
+    /// redistributed. A merge frees a page and rewrites the parent, and a
+    /// merge that empties a root over two leaves collapses the tree to a
+    /// single root leaf (the root page id does not change). Cases that need
+    /// work above the parent are not handled yet (step 11b): the underfull
+    /// leaf then stays as it is, which is valid (ADR 0005, invariant 8). The
+    /// pages are written bottom-up, the emptied pages are freed after that,
+    /// and the value's chain last, so a crash can leak pages but nothing
+    /// points to a freed page. Does not sync.
     ///
     /// Like `put`, `delete` needs `&mut Pager`, so it cannot run while a
     /// [`Cursor`](crate::storage::btree::cursor::Cursor) is alive:
@@ -463,7 +485,6 @@ impl BTree {
         }
 
         let mut buffer = page_buffer(pager);
-        // The path is not used until rebalancing (step 11).
         let mut path = Path::new(self.root);
         let leaf_id = self.descend(pager, Target::Key(key), &mut buffer, &mut path)?;
 
@@ -481,7 +502,13 @@ impl BTree {
             .map_err(node_error)?
             .remove(index)
             .map_err(node_error)?;
-        pager.write_page(leaf_id, &mut buffer)?;
+
+        // An underfull non-root leaf is merged or redistributed (it can also
+        // be left as it is, see the rebalance module). Either way the pages
+        // are written here, and the chain is freed last.
+        let mut pending = Pending::default();
+        rebalance_leaf(pager, &path, leaf_id, buffer, &mut pending)?;
+        pending.write_all(pager)?;
         free_old_chain(pager, old_chain)?;
 
         Ok(true)
@@ -599,22 +626,30 @@ pub(crate) fn page_buffer(pager: &Pager) -> Vec<u8> {
 /// planned, so a failure while planning leaves the existing pages unchanged
 /// (only allocated pages can be left unused).
 #[derive(Debug, Default)]
-struct Pending {
+pub(super) struct Pending {
     /// Pages allocated by the split, with their final content.
-    new_pages: Vec<(PageId, Vec<u8>)>,
+    pub(super) new_pages: Vec<(PageId, Vec<u8>)>,
     /// Existing pages that change, in the order the split reaches them: the
     /// leaf first, then its ancestors, so a modified root comes last.
-    changed: Vec<(PageId, Vec<u8>)>,
+    pub(super) changed: Vec<(PageId, Vec<u8>)>,
+    /// Node pages that a delete emptied (a merged sibling, or the children of
+    /// a collapsed root). They are freed only after every write succeeded.
+    pub(super) freed: Vec<PageId>,
 }
 
 impl Pending {
-    /// Writes the new pages first, then the existing pages bottom-up. If a
-    /// write fails, the tree can be inconsistent until the WAL exists
-    /// (Phase 3). The order keeps it readable as long as possible: until the
-    /// first existing page is written, the old tree is intact.
-    fn write_all(self, pager: &mut Pager) -> Result<(), BTreeError> {
+    /// Writes the new pages first, then the existing pages bottom-up, then
+    /// frees the emptied pages. If a write fails, the tree can be
+    /// inconsistent until the WAL exists (Phase 3). The order keeps it
+    /// readable as long as possible: until the first existing page is
+    /// written, the old tree is intact, and no page is freed while something
+    /// still points to it (a crash can only leak pages).
+    pub(super) fn write_all(self, pager: &mut Pager) -> Result<(), BTreeError> {
         for (id, mut buffer) in self.new_pages.into_iter().chain(self.changed) {
             pager.write_page(id, &mut buffer)?;
+        }
+        for id in self.freed {
+            pager.free_page(id)?;
         }
 
         Ok(())
@@ -729,9 +764,12 @@ fn split_leaf(
     pending.write_all(pager)
 }
 
-/// Chooses the number `k` of combined entries that stay in the left leaf. It
+/// Chooses the number `k` of entries of `combined` that stay in the left leaf. It
 /// is always in `1..len`, so both parts are not empty.
-fn choose_split(combined: &Combined<'_>, append: bool) -> Result<usize, NodeError> {
+pub(super) fn choose_split<S: CellSequence>(
+    combined: &S,
+    append: bool,
+) -> Result<usize, NodeError> {
     let last = combined.len().saturating_sub(1);
     if append {
         // Right-only append: the right leaf gets only the new cell.

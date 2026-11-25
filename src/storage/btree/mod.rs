@@ -6,7 +6,7 @@
 //! cell encodings) and the tree handle with lookup, insert, delete and leaf
 //! splits. Overflow chains for large values live in
 //! [`overflow`](self::overflow), and ordered range scans in
-//! [`cursor`](self::cursor). Delete does not rebalance yet (a later step).
+//! [`cursor`](self::cursor). Delete rebalances leaves (`rebalance`).
 //!
 //! - [`node`](self::node): size limits, [`node::ValueRef`] and the leaf cell codec.
 //! - [`leaf`](self::leaf): [`leaf::LeafNode`] and [`leaf::LeafNodeMut`].
@@ -14,6 +14,7 @@
 //! - [`overflow`](self::overflow): overflow page views and chain read, write and free.
 //! - [`cursor`](self::cursor): [`cursor::Cursor`] and a re-export of
 //!   [`Direction`](crate::storage::engine::Direction), range scans.
+//! - `rebalance`: leaf merge, redistribution and root collapse after a delete.
 //! - [`tree`](self::tree): [`tree::BTree`], the handle of one tree.
 //! - [`engine`](self::engine): [`engine::BTreeEngine`], the `StorageEngine` implementation.
 //! - [`error`](self::error): [`error::NodeError`] and [`error::BTreeError`].
@@ -25,6 +26,7 @@ pub mod internal;
 pub mod leaf;
 pub mod node;
 pub mod overflow;
+mod rebalance;
 pub mod tree;
 
 pub use cursor::{Cursor, Direction};

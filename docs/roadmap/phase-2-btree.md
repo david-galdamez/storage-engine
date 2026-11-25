@@ -57,7 +57,8 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 10  | Delete                        | Remove a key and free its overflow pages, without rebalancing                          | —                                                              | Done    |
 | 10b | Engine trait impl             | Implement StorageEngine for the B+Tree (BTreeEngine owning the pager)                  | —                                                              | Done    |
 | 10c | Engine scan                   | Add scan to StorageEngine: a GAT cursor that lends keys and copies values on request   | —                                                              | Done    |
-| 11  | Rebalancing                   | Merge and redistribute underfull nodes, collapse the root, free empty pages           | Ch. 2 Node Merges; Ch. 4 Rebalancing                           | Planned |
+| 11a | Leaf rebalancing              | Merge and redistribute underfull leaves, collapse a height-2 root, free empty pages   | Ch. 2 Node Merges; Ch. 4 Rebalancing                           | Done    |
+| 11b | Internal rebalancing          | Merge or rotate internal nodes, propagate up, collapse any height, split on delete    | Ch. 2 Node Merges; Ch. 4 Rebalancing                           | Planned |
 | 12  | Verification and model tests  | `verify_tree` invariants; property tests against a `BTreeMap` model, many trees per file | —                                                            | Planned |
 | 13  | REPL on the B+Tree            | The test REPL stores its data in a B+Tree file                                         | —                                                              | Planned |
 | 14  | Docs                          | Update README roadmap, ADRs and this file                                              | —                                                              | Planned |

@@ -1,4 +1,6 @@
-//! Tests for `BTree::delete` (Phase 2, step 10): delete without rebalancing.
+//! Tests for `BTree::delete` (Phase 2, step 10): the delete itself. Since step 11a an
+//! underfull leaf is rebalanced, so the tests that empty leaves allow merged
+//! leaves.
 //! Page size is 512 bytes.
 //!
 //! The tests check:
@@ -10,10 +12,11 @@
 //! - deleting an overflow value frees its whole chain, the free list stays
 //!   valid, no page leaks, and the freed pages are reused by the next large
 //!   value;
-//! - deleting every key of a three-level tree leaves the same height and the
-//!   same leaf chain, and every scan is empty;
-//! - emptying the first, a middle and the last leaf: scans that start inside
-//!   the empty leaf match the model in both directions;
+//! - deleting every key of a three-level tree leaves the same height, the
+//!   leaves that remain in the same order, no leaked page, and every scan is
+//!   empty;
+//! - emptying the first, a middle and the last leaf: scans that start where
+//!   its keys were match the model in both directions;
 //! - deleting a key that is a separator in the root and putting it back;
 //! - refilling an emptied leaf until it splits;
 //! - a corrupt overflow chain: the delete fails after the leaf was written,
@@ -197,6 +200,13 @@ fn leaf_of(pager: &Pager, tree: BTree, key: &[u8]) -> anyhow::Result<PageId> {
     bail!("no leaf holds {key:?}")
 }
 
+/// `true` if `after` is `before` with some leaves removed (merges free the
+/// right leaf of a pair and keep the order of the others).
+fn is_subsequence(after: &[PageId], before: &[PageId]) -> bool {
+    let mut rest = before.iter();
+    after.iter().all(|id| rest.any(|b| b == id))
+}
+
 /// `len` bytes that depend on the position and on `seed`.
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
@@ -356,8 +366,14 @@ fn delete_every_key_of_a_three_level_tree() -> anyhow::Result<()> {
         ensure_missing(get(tree, &pager, key)?.as_deref(), "deleted key")?;
     }
     ensure!(height(&pager, tree.root())? == levels, "height changed");
-    ensure!(leaf_chain(&pager, tree)? == leaves, "leaf chain changed");
+    // Leaves are merged now (step 11a), so some of them are gone, and the
+    // others keep their order.
+    ensure!(
+        is_subsequence(&leaf_chain(&pager, tree)?, &leaves),
+        "leaf chain changed"
+    );
     ensure!(check_tree(&pager, tree)?.is_empty(), "entries left");
+    ensure_no_leaks(&pager, tree)?;
     for (lower, upper) in bound_pairs(b"key-00100", b"key-00900") {
         check_range(tree, &pager, &BTreeMap::new(), &lower, &upper)?;
     }
@@ -386,8 +402,13 @@ fn empty_leaf_at(position: Position) -> anyhow::Result<()> {
         model.remove(key);
     }
 
-    ensure!(leaf_keys(&pager, target)?.is_empty(), "leaf is not empty");
-    ensure!(leaf_chain(&pager, tree)? == leaves, "leaf chain changed");
+    // The emptied leaf may have been merged into a sibling (step 11a), so its
+    // page can be free; the other leaves keep their order. The scans below
+    // still cross the place where its keys were.
+    ensure!(
+        is_subsequence(&leaf_chain(&pager, tree)?, &leaves),
+        "leaf chain changed"
+    );
     let remaining: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     ensure!(check_tree(&pager, tree)? == remaining, "check_tree");
 

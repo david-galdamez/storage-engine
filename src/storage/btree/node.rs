@@ -59,6 +59,24 @@ pub const fn max_node_cell_len(page_size: PageSize) -> usize {
     (usable / 4).saturating_sub(SLOT_SIZE)
 }
 
+/// Returns the usable bytes of a node of `page_size`: the page minus the
+/// common header (32 bytes). Cells and slots live there.
+#[must_use]
+pub const fn usable_space(page_size: PageSize) -> usize {
+    page_size.as_usize().saturating_sub(SLOTTED_HEADER_SIZE)
+}
+
+/// Returns the smallest number of used bytes (cells plus slots) that a
+/// non-root node of `page_size` may have without being underfull.
+///
+/// It is a quarter of the usable space, rounded up (ADR 0005, amendment 3): a
+/// node is underfull when `used * 4 < usable`, that is, when `used` is below
+/// this value. It is 120, 1016 and 16376 for 512, 4096 and 65536.
+#[must_use]
+pub const fn min_node_fill(page_size: PageSize) -> usize {
+    usable_space(page_size).div_ceil(4)
+}
+
 /// Returns the largest key a node of `page_size` accepts.
 ///
 /// It is the largest cell minus the 11 bytes of an overflow leaf cell, so every

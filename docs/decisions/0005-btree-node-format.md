@@ -348,3 +348,68 @@ every call and holds the value of the returned key.
 **Decision:** no new owned-data case. Keys stay borrowed from the cursor's
 leaf buffer, and the value buffer is owned by the caller and reused across
 entries. `BTreeScan` holds only borrows (`Cursor<'a>` and `&'a Pager`).
+
+## Amendment 3 (2026-11-25): leaf rebalancing after delete
+
+Phase 2, step 11a lets `delete` rebalance leaves. This amendment covers the
+leaf level, the root collapse over two leaves, and the order of the writes.
+Step 11b does the same for internal nodes and lifts the restrictions below.
+It supersedes the "Until rebalancing" wording of invariant 8 only for leaves
+that the rules below fix: a leaf that is left underfull is still valid.
+
+**Underflow threshold.** Let `U = page_size - 32` be the usable bytes of a
+node and `used = U - total_free` the bytes of its cells and slots. A non-root
+node is *underfull* when `used * 4 < U`, so a node without cells is always
+underfull. The minimum fill is `ceil(U / 4)`: 120, 1016 and 16376 bytes for
+512, 4096 and 65536 (`min_node_fill`). The root is never underfull and a root
+leaf may be empty. The threshold is a quarter, while a split leaves each half
+at about half (`U / 2`). That gap is the hysteresis: after a split or a
+rebalance, many deletes are needed before the node is underfull again, so a
+workload that alternates `put` and `delete` at the same place does not merge
+and split on every call. The maximum entry is also a quarter of `U` (option
+6), so two underfull nodes always fit together in one page.
+
+**Which sibling.** The sibling must have the same parent: the left one
+(position `pos - 1`) if the leaf is not the first child, otherwise the right
+one (`pos + 1`). The parent is the bottom breadcrumb of the descent. Only
+`next_leaf` links exist (option 2), and a merge always goes *into the left
+page* of the pair: the left page keeps its id and takes the `next_leaf` of the
+right page, the right page is freed. The leaf that points to the left page is
+not touched, so no `prev` link and no neighbour of another parent is needed.
+
+**Merge before redistribute.** If `used(left) + used(right) <= U` the pair is
+merged: the parent loses the separator between them (the pointer after it now
+leads to the left page). Otherwise the cells of both leaves are cut again by
+bytes with the rule of a leaf split (never the append case), and the
+separator in the parent becomes the first key of the new right leaf. A merge
+frees a page and shrinks the parent, which is why it is preferred. Moving a
+cell moves only its reference to an overflow chain, never the chain
+(invariant 7 does not change).
+
+**Root collapse (height 2).** If a merge leaves the root, an internal node
+over leaves, without cells, the merged leaf is written to the root page,
+which keeps its id (option 4), and both leaf pages are freed. The merged leaf
+has no next leaf, because it holds the only two leaves of the tree.
+
+**Write and free order.** The pages are planned in memory and written
+bottom-up: the pair pages, then the parent (the root last). The emptied pages
+are freed after every write succeeded, and the value's overflow chain is
+freed last. A crash can leak pages but nothing points to a freed page. A crash
+between the writes of the pair and the write of the parent during a
+redistribution can leave keys that moved across the separator unreachable
+(the parent still routes them to the other leaf) until the WAL exists
+(Phase 3).
+
+**Separator.** The separator of a redistribution is copied into one owned
+`Vec<u8>`, like the one of a split (amendment 1), for the same reason: the
+buffer that holds the key moves into the pending writes. No new owned-data
+case.
+
+**Restrictions of step 11a.** In these cases the underfull leaf is not
+rebalanced and stays as it is, which invariant 8 allows. Step 11b lifts them:
+
+- a merge that would leave a non-root parent without cells;
+- a redistribution whose new separator does not fit in the parent;
+- any work above the parent of the leaf: after a merge the parent is not
+  checked for underflow, so it can stay underfull (but it always keeps at
+  least one cell), and there is no collapse at height 3 or more.
