@@ -2,7 +2,7 @@
 //!
 //! The split cases are in `btree_split.rs`; here a full leaf is split and
 //! every key is kept. Multi-level trees are built by hand with the helpers in
-//! `btree_support`, with leaves that have a little free room. Page size is 512
+//! `support/build.rs`, with leaves that have a little free room. Page size is 512
 //! bytes.
 //!
 //! The tests check:
@@ -20,16 +20,23 @@
 //! - `put` survives closing and reopening the file;
 //! - a property test against a `BTreeMap` model.
 
-mod btree_support;
+#[path = "support/build.rs"]
+mod build;
+#[path = "support/db.rs"]
+mod db;
+#[path = "support/lookup.rs"]
+mod lookup;
+#[path = "support/shape.rs"]
+mod shape;
 
+use build::{bulk_load, write_leaf};
+use db::{new_pager, page_size, temp_db};
+use lookup::{ensure_missing, ensure_value, get};
+use shape::{blank, height, numbered_entries};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
-use btree_support::{
-    blank, bulk_load, ensure_missing, ensure_value, get, height, new_pager, numbered_entries,
-    page_size, temp_db, write_leaf,
-};
 use proptest::prelude::*;
 use storage_engine_rs::storage::btree::BTree;
 use storage_engine_rs::storage::btree::error::BTreeError;

@@ -14,35 +14,21 @@
 //! - after `sync`, `into_pager` and a reopen, `open_tree` finds the data, and
 //!   it rejects page 0 and a page past the end.
 
+#[path = "support/db.rs"]
+mod db;
+
 use anyhow::ensure;
+use db::{new_pager, temp_db};
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use proptest::prelude::*;
 use storage_engine_rs::storage::btree::error::BTreeError;
 use storage_engine_rs::storage::btree::{BTree, BTreeEngine};
 use storage_engine_rs::storage::engine::{Direction, EngineCursor, StorageEngine};
-use storage_engine_rs::storage::pager::disk::{Pager, PagerOptions};
-use storage_engine_rs::storage::pager::types::{PageId, PageSize};
-use tempfile::TempDir;
-
-// `btree_support` is not used here: a test binary must use every item of a
-// module it includes, and this file needs only these two helpers.
-fn temp_db() -> anyhow::Result<(TempDir, PathBuf)> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("test.db");
-    Ok((dir, path))
-}
-
-fn new_pager(path: &Path) -> anyhow::Result<Pager> {
-    Ok(Pager::create(
-        path,
-        PagerOptions {
-            page_size: PageSize::new(512)?,
-        },
-    )?)
-}
+use storage_engine_rs::storage::pager::disk::Pager;
+use storage_engine_rs::storage::pager::types::PageId;
 
 fn lookup<E: StorageEngine>(e: &E, tree: E::Tree, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
     let mut out = Vec::new();

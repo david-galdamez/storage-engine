@@ -1,54 +1,27 @@
-//! Shared helpers for the B+Tree integration tests.
+//! Hand-built trees for the B+Tree integration tests.
 //!
-//! Splits do not exist yet, so the tests build trees by hand with the public
-//! node API: `write_leaf`, `write_internal` and a small bottom-up bulk loader.
-//! The root of a hand-built tree is not the page `BTree::create` made, so the
-//! tests use `BTree::open(pager, root)` to get the handle.
+//! The tests build trees with the public node API: `write_leaf`,
+//! `write_internal` and a small bottom-up bulk loader. The root of a
+//! hand-built tree is not the page `BTree::create` made, so the tests use
+//! `BTree::open(pager, root)` to get the handle.
 //!
-//! Each test binary that includes this module with `mod btree_support;` must
-//! use every item, or `dead_code` fires.
+//! Included with `#[path = "support/build.rs"] mod build;`. Every binary that
+//! includes it must use all of it, or `dead_code` fires.
 
-use std::path::{Path, PathBuf};
-
-use anyhow::{Context, ensure};
-use storage_engine_rs::storage::btree::BTree;
+use anyhow::Context;
 use storage_engine_rs::storage::btree::error::NodeError;
-use storage_engine_rs::storage::btree::internal::{InternalNode, InternalNodeMut};
+use storage_engine_rs::storage::btree::internal::InternalNodeMut;
 use storage_engine_rs::storage::btree::leaf::LeafNodeMut;
 use storage_engine_rs::storage::btree::node::ValueRef;
-use storage_engine_rs::storage::pager::disk::{Pager, PagerOptions};
+use storage_engine_rs::storage::pager::disk::Pager;
 use storage_engine_rs::storage::pager::error::PageError;
-use storage_engine_rs::storage::pager::types::{PageId, PageSize};
-use tempfile::TempDir;
+use storage_engine_rs::storage::pager::types::PageId;
 
-pub const PAGE_SIZE: usize = 512;
+use crate::shape::blank;
 
 /// Maximum number of children the bulk loader gives an internal node. Small,
 /// so that a few hundred entries already make three levels.
 const FANOUT: usize = 4;
-
-pub fn page_size() -> anyhow::Result<PageSize> {
-    Ok(PageSize::new(u32::try_from(PAGE_SIZE)?)?)
-}
-
-pub fn temp_db() -> anyhow::Result<(TempDir, PathBuf)> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("test.db");
-    Ok((dir, path))
-}
-
-pub fn new_pager(path: &Path) -> anyhow::Result<Pager> {
-    Ok(Pager::create(
-        path,
-        PagerOptions {
-            page_size: page_size()?,
-        },
-    )?)
-}
-
-pub fn blank() -> Vec<u8> {
-    vec![0u8; PAGE_SIZE]
-}
 
 /// Formats `id` as a leaf with `entries` (sorted, unique) and writes it.
 pub fn write_leaf_at(
@@ -192,50 +165,4 @@ pub fn bulk_load(pager: &mut Pager, entries: &[(Vec<u8>, Vec<u8>)]) -> anyhow::R
     }
 
     Ok(level.first().context("no root")?.1)
-}
-
-/// Number of levels from the root down to a leaf, following child 0.
-pub fn height(pager: &Pager, root: PageId) -> anyhow::Result<usize> {
-    let mut id = root;
-    let mut levels = 1usize;
-    loop {
-        let mut buf = blank();
-        pager.read_page(id, &mut buf)?;
-        match InternalNode::new(&buf) {
-            Ok(node) => {
-                id = node.child_at(0)?;
-                levels = levels.checked_add(1).context("overflow")?;
-            }
-            Err(_) => return Ok(levels),
-        }
-    }
-}
-
-pub fn get(tree: BTree, pager: &Pager, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-    let mut out = Vec::new();
-    Ok(tree.get(pager, key, &mut out)?.then_some(out))
-}
-
-pub fn ensure_value(got: Option<&[u8]>, expected: &[u8], what: &str) -> anyhow::Result<()> {
-    ensure!(
-        got == Some(expected),
-        "{what}: expected {expected:?}, got {got:?}"
-    );
-    Ok(())
-}
-
-pub fn ensure_missing(got: Option<&[u8]>, what: &str) -> anyhow::Result<()> {
-    ensure!(got.is_none(), "{what}: expected a miss, got {got:?}");
-    Ok(())
-}
-
-pub fn numbered_entries(count: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-    (0..count)
-        .map(|i| {
-            (
-                format!("key-{:05}", i.saturating_mul(2)).into_bytes(),
-                format!("value-{i}").into_bytes(),
-            )
-        })
-        .collect()
 }

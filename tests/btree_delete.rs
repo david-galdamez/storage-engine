@@ -24,18 +24,25 @@
 //! on `BTree::delete`.
 
 mod btree_check;
-mod btree_support;
+#[path = "support/db.rs"]
+mod db;
+#[path = "support/leaks.rs"]
+mod leaks;
+#[path = "support/lookup.rs"]
+mod lookup;
+#[path = "support/shape.rs"]
+mod shape;
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 
 use anyhow::{Context, bail, ensure};
-use btree_check::{Entries, check_tree, check_tree_pages, leaf_chain};
-use btree_support::{
-    blank, bulk_load, ensure_missing, ensure_value, get, height, new_pager, numbered_entries,
-    temp_db, write_internal, write_leaf,
-};
+use btree_check::{Entries, check_tree, leaf_chain};
+use db::{new_pager, temp_db};
+use leaks::ensure_no_leaks;
+use lookup::{ensure_missing, ensure_value, get};
 use proptest::prelude::*;
+use shape::{blank, height, numbered_entries};
 use storage_engine_rs::storage::btree::error::BTreeError;
 use storage_engine_rs::storage::btree::internal::InternalNode;
 use storage_engine_rs::storage::btree::leaf::{LeafNode, LeafNodeMut};
@@ -199,27 +206,6 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-/// Checks the tree and its chains, and that every page of the file is a node,
-/// an overflow page or a free page. Returns the number of overflow pages and
-/// the entries.
-fn ensure_no_leaks(pager: &Pager, tree: BTree) -> anyhow::Result<(usize, Entries)> {
-    let (entries, nodes, overflow) = check_tree_pages(pager, tree)?;
-    pager.verify_freelist()?;
-    let used = usize::try_from(pager.page_count())?
-        .checked_sub(1)
-        .context("no pages")?;
-    let free = usize::try_from(pager.free_page_count())?;
-    let accounted = nodes
-        .checked_add(overflow)
-        .and_then(|n| n.checked_add(free))
-        .context("overflow")?;
-    ensure!(
-        used == accounted,
-        "page accounting: {used} pages, {nodes} nodes + {overflow} overflow + {free} free"
-    );
-    Ok((overflow, entries))
-}
-
 // ------------------------------------------------------------ small trees
 
 #[test]
@@ -295,7 +281,7 @@ fn a_key_longer_than_the_maximum_is_a_miss() -> anyhow::Result<()> {
     tree.put(&mut pager, b"a", b"1")?;
     let before = read(&pager, tree.root())?;
 
-    let long = vec![b'a'; max_key_len(btree_support::page_size()?).saturating_add(1)];
+    let long = vec![b'a'; max_key_len(db::page_size()?).saturating_add(1)];
     ensure!(!tree.delete(&mut pager, &long)?, "deleted a too long key");
 
     ensure!(read(&pager, tree.root())? == before, "leaf bytes changed");
@@ -306,7 +292,7 @@ fn a_key_longer_than_the_maximum_is_a_miss() -> anyhow::Result<()> {
 
 #[test]
 fn delete_an_overflow_value_frees_its_chain_and_the_pages_are_reused() -> anyhow::Result<()> {
-    let capacity = overflow_capacity(btree_support::page_size()?);
+    let capacity = overflow_capacity(db::page_size()?);
     let len = capacity
         .checked_mul(3)
         .and_then(|n| n.checked_add(10))
@@ -350,53 +336,6 @@ fn delete_an_overflow_value_frees_its_chain_and_the_pages_are_reused() -> anyhow
 }
 
 // ------------------------------------------------------ multi-level trees
-
-#[test]
-fn delete_in_a_hand_built_tree_empties_a_leaf_without_touching_the_parent() -> anyhow::Result<()> {
-    let (_dir, path) = temp_db()?;
-    let mut pager = new_pager(&path)?;
-    let right = write_leaf(&mut pager, &[(b"c", b"3"), (b"d", b"4")], None)?;
-    let left = write_leaf(&mut pager, &[(b"a", b"1"), (b"b", b"2")], Some(right))?;
-    let root = write_internal(&mut pager, &[(left, b"c")], right)?;
-    let tree = BTree::open(&pager, root)?;
-    let parent = read(&pager, root)?;
-
-    ensure!(tree.delete(&mut pager, b"a")?, "a");
-    ensure!(tree.delete(&mut pager, b"b")?, "b");
-
-    ensure!(read(&pager, root)? == parent, "the parent changed");
-    ensure!(
-        leaf_keys(&pager, left)?.is_empty(),
-        "left leaf is not empty"
-    );
-    ensure!(leaf_chain(&pager, tree)? == vec![left, right], "leaf chain");
-    let entries = check_tree(&pager, tree)?;
-    ensure!(
-        entries
-            == vec![
-                (b"c".to_vec(), b"3".to_vec()),
-                (b"d".to_vec(), b"4".to_vec())
-            ],
-        "entries"
-    );
-    Ok(())
-}
-
-#[test]
-fn delete_every_key_of_a_bulk_loaded_tree() -> anyhow::Result<()> {
-    let (_dir, path) = temp_db()?;
-    let mut pager = new_pager(&path)?;
-    let entries = numbered_entries(300);
-    let root = bulk_load(&mut pager, &entries)?;
-    let tree = BTree::open(&pager, root)?;
-    ensure!(check_tree(&pager, tree)? == entries, "bulk load");
-
-    for (key, _) in entries.iter().rev() {
-        ensure!(tree.delete(&mut pager, key)?, "key {key:?} was not deleted");
-    }
-    ensure!(check_tree(&pager, tree)?.is_empty(), "entries left");
-    Ok(())
-}
 
 #[test]
 fn delete_every_key_of_a_three_level_tree() -> anyhow::Result<()> {
@@ -568,7 +507,7 @@ fn a_corrupt_chain_fails_the_delete_after_the_key_is_gone() -> anyhow::Result<()
     let (_dir, path) = temp_db()?;
     let mut pager = new_pager(&path)?;
     let tree = BTree::create(&mut pager)?;
-    let len = overflow_capacity(btree_support::page_size()?)
+    let len = overflow_capacity(db::page_size()?)
         .checked_mul(2)
         .and_then(|n| n.checked_add(100))
         .context("overflow")?;

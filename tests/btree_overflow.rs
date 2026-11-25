@@ -24,18 +24,28 @@
 //! here.
 
 mod btree_check;
-mod btree_support;
+#[path = "support/build.rs"]
+mod build;
+#[path = "support/db.rs"]
+mod db;
+#[path = "support/leaks.rs"]
+mod leaks;
+#[path = "support/lookup.rs"]
+mod lookup;
+#[path = "support/shape.rs"]
+mod shape;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
-use btree_check::{Entries, check_tree, check_tree_pages, leaf_chain};
-use btree_support::{
-    PAGE_SIZE, blank, bulk_load, ensure_missing, ensure_value, get, height, new_pager,
-    numbered_entries, page_size, temp_db, write_leaf,
-};
+use btree_check::{Entries, check_tree, leaf_chain};
+use build::{bulk_load, write_leaf};
+use db::{PAGE_SIZE, new_pager, page_size, temp_db};
+use leaks::ensure_no_leaks;
+use lookup::{ensure_missing, ensure_value, get};
 use proptest::prelude::*;
+use shape::{blank, height, numbered_entries};
 use storage_engine_rs::storage::btree::BTree;
 use storage_engine_rs::storage::btree::error::{BTreeError, NodeError};
 use storage_engine_rs::storage::btree::leaf::{LeafNode, LeafNodeMut};
@@ -78,27 +88,6 @@ fn key_of(i: usize) -> Vec<u8> {
 
 const fn pages_for(len: usize, capacity: usize) -> usize {
     len.div_ceil(capacity)
-}
-
-/// Checks the tree and that no page of the file is leaked: every page but the
-/// file header is a node, an overflow page or in the free list. Returns the
-/// number of overflow pages and the entries. Only for a file with one tree.
-fn ensure_no_leaks(pager: &Pager, tree: BTree) -> anyhow::Result<(usize, Entries)> {
-    let (entries, nodes, overflow) = check_tree_pages(pager, tree)?;
-    pager.verify_freelist()?;
-    let used = usize::try_from(pager.page_count())?
-        .checked_sub(1)
-        .context("no pages")?;
-    let free = usize::try_from(pager.free_page_count())?;
-    let accounted = nodes
-        .checked_add(overflow)
-        .and_then(|n| n.checked_add(free))
-        .context("overflow")?;
-    ensure!(
-        used == accounted,
-        "page accounting: {used} pages, {nodes} nodes + {overflow} overflow + {free} free"
-    );
-    Ok((overflow, entries))
 }
 
 fn read(pager: &Pager, id: PageId) -> anyhow::Result<Vec<u8>> {

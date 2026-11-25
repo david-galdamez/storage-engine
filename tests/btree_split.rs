@@ -23,17 +23,24 @@
 //! - a property test against a `BTreeMap` model.
 
 mod btree_check;
-mod btree_support;
+#[path = "support/build.rs"]
+mod build;
+#[path = "support/db.rs"]
+mod db;
+#[path = "support/lookup.rs"]
+mod lookup;
+#[path = "support/shape.rs"]
+mod shape;
 
 use std::collections::BTreeMap;
 
 use anyhow::{Context, bail, ensure};
 use btree_check::{Entries, check_tree, leaf_chain};
-use btree_support::{
-    PAGE_SIZE, blank, bulk_load, ensure_missing, ensure_value, get, height, new_pager,
-    numbered_entries, temp_db, write_leaf,
-};
+use build::{bulk_load, write_leaf};
+use db::{PAGE_SIZE, new_pager, temp_db};
+use lookup::{ensure_missing, ensure_value, get};
 use proptest::prelude::*;
+use shape::{blank, height, numbered_entries};
 use storage_engine_rs::storage::btree::BTree;
 use storage_engine_rs::storage::btree::error::NodeError;
 use storage_engine_rs::storage::btree::internal::InternalNode;

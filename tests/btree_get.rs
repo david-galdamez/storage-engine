@@ -1,6 +1,6 @@
 //! Tests for `BTree::get` (Phase 2, step 4).
 //!
-//! Trees are built by hand with the helpers in `btree_support`.
+//! Trees are built by hand with the helpers in `support/build.rs`.
 //!
 //! The tests check:
 //!
@@ -20,15 +20,22 @@
 //!
 //! Page size is 512 bytes.
 
-mod btree_support;
+#[path = "support/build.rs"]
+mod build;
+#[path = "support/db.rs"]
+mod db;
+#[path = "support/lookup.rs"]
+mod lookup;
+#[path = "support/shape.rs"]
+mod shape;
 
+use build::{bulk_load, write_internal, write_internal_at, write_leaf};
+use db::{new_pager, page_size, temp_db};
+use lookup::{ensure_missing, ensure_value, get};
+use shape::{blank, height, numbered_entries};
 use std::collections::BTreeMap;
 
 use anyhow::{Context, bail, ensure};
-use btree_support::{
-    blank, bulk_load, ensure_missing, ensure_value, get, height, new_pager, numbered_entries,
-    page_size, temp_db, write_internal, write_internal_at, write_leaf,
-};
 use proptest::prelude::*;
 use storage_engine_rs::storage::btree::BTree;
 use storage_engine_rs::storage::btree::error::BTreeError;
