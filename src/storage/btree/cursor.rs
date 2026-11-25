@@ -37,14 +37,7 @@ use crate::storage::pager::{
     types::PageId,
 };
 
-/// The order in which a [`Cursor`] returns keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    /// Ascending key order, from the lower bound to the upper bound.
-    Forward,
-    /// Descending key order, from the upper bound to the lower bound.
-    Reverse,
-}
+pub use crate::storage::engine::Direction;
 
 /// A cursor over a key range of one tree, created by [`BTree::range`].
 ///

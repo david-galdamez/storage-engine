@@ -8,12 +8,17 @@
 //!   else. Dropping the engine does not sync.
 //! - There is no write-ahead log yet, so a crash in the middle of a split can
 //!   still corrupt the file until the WAL arrives (Phase 3).
+//! - [`StorageEngine::scan`] returns a [`BTreeScan`], which wraps the B+Tree
+//!   [`Cursor`] and reads a value (inline or from an overflow chain) only when
+//!   the caller passes a buffer for it.
 //! - The file header `catalog_root` is not touched. Trees are found by their
 //!   root page id with [`BTreeEngine::open_tree`].
 
+use std::ops::Bound;
+
 use crate::storage::{
-    btree::{BTree, error::BTreeError},
-    engine::StorageEngine,
+    btree::{BTree, Cursor, error::BTreeError, overflow},
+    engine::{Direction, EngineCursor, StorageEngine},
     pager::{disk::Pager, types::PageId},
 };
 
@@ -66,6 +71,7 @@ impl BTreeEngine {
 impl StorageEngine for BTreeEngine {
     type Tree = BTree;
     type Error = BTreeError;
+    type Cursor<'a> = BTreeScan<'a>;
 
     fn create_tree(&mut self) -> Result<Self::Tree, Self::Error> {
         BTree::create(&mut self.pager)
@@ -82,5 +88,69 @@ impl StorageEngine for BTreeEngine {
 
     fn delete(&mut self, tree: Self::Tree, key: &[u8]) -> Result<bool, Self::Error> {
         tree.delete(&mut self.pager, key)
+    }
+
+    fn scan<'a>(
+        &'a self,
+        tree: Self::Tree,
+        lower: Bound<&'a [u8]>,
+        upper: Bound<&'a [u8]>,
+        dir: Direction,
+    ) -> Result<Self::Cursor<'a>, Self::Error> {
+        tree.range(&self.pager, lower, upper, dir)
+            .map(|cursor| BTreeScan {
+                cursor,
+                pager: &self.pager,
+                done: false,
+            })
+    }
+}
+
+/// The [`EngineCursor`] of [`BTreeEngine`]: a B+Tree [`Cursor`] plus the
+/// pager, to read overflow values on request.
+///
+/// It is fused. After the end of the range or any error, including an error
+/// while reading a value, every later call returns `Ok(None)`.
+#[derive(Debug)]
+pub struct BTreeScan<'a> {
+    cursor: Cursor<'a>,
+    pager: &'a Pager,
+    done: bool,
+}
+
+impl EngineCursor for BTreeScan<'_> {
+    type Error = BTreeError;
+
+    fn next_entry(
+        &mut self,
+        mut value: Option<&mut Vec<u8>>,
+    ) -> Result<Option<&[u8]>, Self::Error> {
+        if self.done {
+            return Ok(None);
+        }
+        if let Some(buffer) = value.as_deref_mut() {
+            buffer.clear();
+        }
+
+        let cell = match self.cursor.next_entry() {
+            Ok(Some(cell)) => cell,
+            Ok(None) => {
+                self.done = true;
+                return Ok(None);
+            }
+            Err(error) => {
+                self.done = true;
+                return Err(error);
+            }
+        };
+
+        if let Some(buffer) = value
+            && let Err(error) = overflow::read_value(self.pager, cell.value, buffer)
+        {
+            self.done = true;
+            buffer.clear();
+            return Err(error);
+        }
+        Ok(Some(cell.key))
     }
 }

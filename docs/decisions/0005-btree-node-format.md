@@ -333,3 +333,18 @@ AGENTS.md section 5.1 asks to try borrowing first:
 
 **Decision:** option 6. The page buffers stay owned `Vec<u8>` as in option 7
 of this ADR.
+
+## Amendment 2 (2026-11-25): scan at the engine level
+
+Phase 2, step 10c adds `StorageEngine::scan`. Option 7 of this ADR lends
+`(&[u8], ValueRef)` from the B+Tree cursor. `ValueRef` is a B+Tree detail
+(inline bytes or an overflow chain), so it does not appear in the engine
+trait. At the engine level the choice is the same one `get` made: **lend the
+key; copy the value into a caller-owned buffer only when asked.**
+`EngineCursor::next_entry` takes `Option<&mut Vec<u8>>`. With `None`, no value
+is read and no overflow page is touched. With `Some`, the buffer is cleared on
+every call and holds the value of the returned key.
+
+**Decision:** no new owned-data case. Keys stay borrowed from the cursor's
+leaf buffer, and the value buffer is owned by the caller and reused across
+entries. `BTreeScan` holds only borrows (`Cursor<'a>` and `&'a Pager`).
