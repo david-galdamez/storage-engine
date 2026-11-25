@@ -16,10 +16,9 @@
 //! and a split root keeps its page id. A value that does not fit inline goes
 //! to a chain of overflow pages (see [`crate::storage::btree::overflow`]), and
 //! `get` reads it back. `delete` removes a cell and frees its chain, and
-//! rebalances an underfull leaf (the private `rebalance` module):
-//! it can free pages and rewrite the parent. Internal nodes are not
-//! rebalanced yet, so a leaf can stay underfull or empty (ADR 0005, invariant
-//! 8). The descent is shared: `descend` finds the leaf for a key or the
+//! rebalances underfull nodes up the tree (the private `rebalance` module):
+//! it can free pages, rewrite or split the parent, and shrink the tree. No
+//! non-root node is left empty (ADR 0005, invariant 8). The descent is shared: `descend` finds the leaf for a key or the
 //! first or last leaf of the tree, and the range cursor reuses it to seek.
 
 use std::cmp::Ordering;
@@ -444,12 +443,13 @@ impl BTree {
     ///
     /// If the leaf is not the root and ends up underfull (ADR 0005, amendment
     /// 3), it is merged into a sibling with the same parent, or the two are
-    /// redistributed. A merge frees a page and rewrites the parent, and a
-    /// merge that empties a root over two leaves collapses the tree to a
-    /// single root leaf (the root page id does not change). Cases that need
-    /// work above the parent are not handled yet (step 11b): the underfull
-    /// leaf then stays as it is, which is valid (ADR 0005, invariant 8). The
-    /// pages are written bottom-up, the emptied pages are freed after that,
+    /// redistributed. A merge frees a page and removes a cell from the parent,
+    /// which is then rebalanced in turn if it is underfull, up to the root. A
+    /// merge that empties the root collapses the tree by one level (the root
+    /// page id does not change). A redistribution whose new separator does not
+    /// fit in the parent splits the parent, which can allocate pages and add a
+    /// level. The pages are written new pages first, then changed pages
+    /// bottom-up with the root last, the emptied pages are freed after that,
     /// and the value's chain last, so a crash can leak pages but nothing
     /// points to a freed page. Does not sync.
     ///
@@ -471,14 +471,15 @@ impl BTree {
     ///
     /// # Errors
     ///
-    /// - [`BTreeError::Pager`] if a read or a write fails or a checksum is
-    ///   wrong.
+    /// - [`BTreeError::Pager`] if a read, an allocation or a write fails or a
+    ///   checksum is wrong.
     /// - [`BTreeError::Node`] if a node on the path does not decode.
     /// - [`BTreeError::CorruptTree`] if the root or a child is not a B+Tree
-    ///   node, the descent is deeper than the maximum height, or the old
-    ///   overflow chain is corrupt (checked while freeing it, after the leaf
-    ///   was written, so the key is already deleted and the pages before the
-    ///   bad one are freed).
+    ///   node, the descent is deeper than the maximum height, an internal node
+    ///   has no cells or does not lead to the child it was reached through, or
+    ///   the old overflow chain is corrupt (checked while freeing it, after
+    ///   the pages were written, so the key is already deleted and the pages
+    ///   before the bad one are freed).
     pub fn delete(self, pager: &mut Pager, key: &[u8]) -> Result<bool, BTreeError> {
         if key.len() > max_key_len(pager.page_size()) {
             return Ok(false);
@@ -759,7 +760,7 @@ fn split_leaf(
         left: buffer,
         right,
     };
-    propagate_split(pager, path, &mut pending, &mut separator, node)?;
+    propagate_split(pager, path.as_slice(), &mut pending, &mut separator, node)?;
 
     pending.write_all(pager)
 }
@@ -844,12 +845,12 @@ fn first_key(buffer: &[u8]) -> Result<&[u8], NodeError> {
 /// root and [`place_root_split`] gives it a new root.
 fn propagate_split(
     pager: &mut Pager,
-    path: &Path,
+    crumbs: &[Crumb],
     pending: &mut Pending,
     separator: &mut Vec<u8>,
     mut node: SplitNode,
 ) -> Result<(), BTreeError> {
-    let mut remaining = path.as_slice();
+    let mut remaining = crumbs;
     while let Some((crumb, above)) = remaining.split_last() {
         let parent_error = |source| BTreeError::Node {
             page: crumb.page,
@@ -982,20 +983,66 @@ fn link_leaves(left: &mut [u8], right_id: PageId) -> Result<(), NodeError> {
 }
 
 /// The full internal node that has to split, and the cell it must take.
-struct InternalTarget<'a> {
+pub(super) struct InternalTarget<'a> {
     /// Page id of the node, for errors.
-    page: PageId,
+    pub(super) page: PageId,
     /// The page of the node, unchanged.
-    buffer: &'a [u8],
+    pub(super) buffer: &'a [u8],
     /// Position where the new cell goes, from the crumb.
-    pos: usize,
+    pub(super) pos: usize,
     /// The child that split: it is the child of the new cell.
-    left_child: PageId,
+    pub(super) left_child: PageId,
     /// The new right half of that child: it replaces the old pointer, which
     /// moves to position `pos + 1`.
-    right_child: PageId,
+    pub(super) right_child: PageId,
     /// `true` if the node is on the rightmost spine (right-only append).
-    append: bool,
+    pub(super) append: bool,
+}
+
+/// Splits the full internal node `target` and gives its halves to the tree
+/// above it, walking `crumbs` (the crumbs above the node) like
+/// [`propagate_split`]. `separator` is the new cell's key on entry. The delete
+/// rebalancing uses it when a redistribution gives the parent a separator that
+/// does not fit.
+pub(super) fn split_parent(
+    pager: &mut Pager,
+    crumbs: &[Crumb],
+    pending: &mut Pending,
+    target: &InternalTarget<'_>,
+    separator: &mut Vec<u8>,
+) -> Result<(), BTreeError> {
+    let (left, right) = split_internal(target, separator)?;
+    let node = SplitNode {
+        page: target.page,
+        left,
+        right,
+    };
+
+    propagate_split(pager, crumbs, pending, separator, node)
+}
+
+/// A sequence of internal cells in key order that is not stored in one place:
+/// the cells of a full node plus a new one ([`CombinedInternal`]), or the cells
+/// of two sibling nodes and the separator between them (`InternalPair` in the
+/// rebalance module). Cell `j` has a key and a child. The child at position
+/// `len` is the rightmost child. A split or a redistribution chooses where to
+/// cut it by bytes, without copying the cells.
+pub(super) trait InternalSequence {
+    /// Number of cells.
+    fn len(&self) -> usize;
+
+    /// Key of cell `j`, for `j < len`.
+    fn key(&self, j: usize) -> Result<&[u8], NodeError>;
+
+    /// Child at position `j`, for `j` in `0..=len`.
+    fn child_at(&self, j: usize) -> Result<PageId, NodeError>;
+
+    /// Bytes that cell `j` uses in a page: its cell plus its slot.
+    fn cell_bytes(&self, j: usize) -> Result<usize, NodeError> {
+        Ok(INTERNAL_CELL_HEADER_SIZE
+            .saturating_add(self.key(j)?.len())
+            .saturating_add(SLOT_SIZE))
+    }
 }
 
 /// The cells of a full internal node plus the new cell, in key order, without
@@ -1011,7 +1058,7 @@ struct CombinedInternal<'a> {
     right_child: PageId,
 }
 
-impl<'a> CombinedInternal<'a> {
+impl InternalSequence for CombinedInternal<'_> {
     /// Number of cells: the cells of the node plus the new one.
     fn len(&self) -> usize {
         self.node.cell_count().saturating_add(1)
@@ -1019,7 +1066,7 @@ impl<'a> CombinedInternal<'a> {
 
     /// Key of cell `j`: `j < pos` is node cell `j`, `j == pos` is the new
     /// separator and `j > pos` is node cell `j - 1`.
-    fn key(&self, j: usize) -> Result<&'a [u8], NodeError> {
+    fn key(&self, j: usize) -> Result<&[u8], NodeError> {
         match j.cmp(&self.pos) {
             Ordering::Less => self.node.key(j),
             Ordering::Equal => Ok(self.separator),
@@ -1036,13 +1083,6 @@ impl<'a> CombinedInternal<'a> {
             Ordering::Equal => Ok(self.right_child),
             Ordering::Greater => self.node.child_at(j.saturating_sub(1)),
         }
-    }
-
-    /// Bytes that cell `j` uses in a page: its cell plus its slot.
-    fn cell_bytes(&self, j: usize) -> Result<usize, NodeError> {
-        Ok(INTERNAL_CELL_HEADER_SIZE
-            .saturating_add(self.key(j)?.len())
-            .saturating_add(SLOT_SIZE))
     }
 }
 
@@ -1084,13 +1124,7 @@ fn split_internal(
 
     // Both halves are built from the virtual sequence, so every borrowed key
     // is still valid while it is copied.
-    let mut left = vec![0u8; target.buffer.len()];
-    let mut right = vec![0u8; target.buffer.len()];
-    let left_rightmost = combined.child_at(m).map_err(node_error)?;
-    fill_internal(&mut left, &combined, 0..m, left_rightmost).map_err(node_error)?;
-    let right_rightmost = combined.child_at(n).map_err(node_error)?;
-    let after = m.saturating_add(1);
-    fill_internal(&mut right, &combined, after..n, right_rightmost).map_err(node_error)?;
+    let (left, right) = build_halves(&combined, m, target.buffer.len()).map_err(node_error)?;
 
     // The promoted key is either the new separator (already in the vector) or
     // a key of the node. The `combined` borrow of the vector ends here.
@@ -1109,8 +1143,8 @@ fn split_internal(
 
 /// Chooses the combined cell `m` that is promoted. It is always in `1..=n - 2`,
 /// so both halves have at least one cell.
-fn choose_internal_split(
-    combined: &CombinedInternal<'_>,
+pub(super) fn choose_internal_split<S: InternalSequence>(
+    combined: &S,
     append: bool,
 ) -> Result<usize, NodeError> {
     let last = combined.len().saturating_sub(2);
@@ -1139,11 +1173,34 @@ fn choose_internal_split(
     Ok(last)
 }
 
+/// Builds the two halves of a split of `combined` at cell `m`, each in a new
+/// buffer of `page_len` bytes. The left half gets the cells `0..m` and, as
+/// rightmost child, the child of cell `m`. Cell `m` is in neither half. The
+/// right half gets the cells `m + 1..n` and the rightmost child of `combined`.
+pub(super) fn build_halves<S: InternalSequence>(
+    combined: &S,
+    m: usize,
+    page_len: usize,
+) -> Result<(Vec<u8>, Vec<u8>), NodeError> {
+    let n = combined.len();
+    let mut left = vec![0u8; page_len];
+    let mut right = vec![0u8; page_len];
+    fill_internal(&mut left, combined, 0..m, combined.child_at(m)?)?;
+    fill_internal(
+        &mut right,
+        combined,
+        m.saturating_add(1)..n,
+        combined.child_at(n)?,
+    )?;
+
+    Ok((left, right))
+}
+
 /// Formats `buffer` as an internal node with `rightmost` as its rightmost
 /// child and fills it with the combined cells in `cells`.
-fn fill_internal(
+pub(super) fn fill_internal<S: InternalSequence>(
     buffer: &mut [u8],
-    combined: &CombinedInternal<'_>,
+    combined: &S,
     cells: Range<usize>,
     rightmost: PageId,
 ) -> Result<(), NodeError> {

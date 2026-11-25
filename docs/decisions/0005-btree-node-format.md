@@ -275,12 +275,15 @@ there is no migration.
    can leak pages but never leaves a cell pointing to a freed page (until the
    WAL, Phase 3). Delete follows the same order: it writes the leaf without
    the cell before it frees the chain.
-8. Until rebalancing (Phase 2, step 11), deletes can leave empty leaves. They
-   stay linked, and cursors skip them. Internal nodes always have at least
-   one cell, except for the moment inside a root collapse.
+8. After every operation, a non-root leaf is not empty and every internal
+   node has at least one cell. Only a root leaf may be empty. No minimum fill
+   is guaranteed: a node can stay below the underflow threshold (for example
+   after right-only appends, or the root). An internal node can have no cells
+   only for the moment inside a rebalance or a root collapse (amendment 3).
+   Files written before step 11 can contain empty leaves, which stay linked
+   and which cursors skip.
 
-The thresholds for merging and redistributing nodes are decided in step 11 and
-added to this ADR as an amendment.
+The thresholds for merging and redistributing nodes are in amendment 3.
 
 ## Consequences
 
@@ -353,9 +356,8 @@ entries. `BTreeScan` holds only borrows (`Cursor<'a>` and `&'a Pager`).
 
 Phase 2, step 11a lets `delete` rebalance leaves. This amendment covers the
 leaf level, the root collapse over two leaves, and the order of the writes.
-Step 11b does the same for internal nodes and lifts the restrictions below.
-It supersedes the "Until rebalancing" wording of invariant 8 only for leaves
-that the rules below fix: a leaf that is left underfull is still valid.
+Step 11b (see the subsection at the end) does the same for internal nodes and
+lifts the restrictions that 11a had. Invariant 8 was tightened by 11b.
 
 **Underflow threshold.** Let `U = page_size - 32` be the usable bytes of a
 node and `used = U - total_free` the bytes of its cells and slots. A non-root
@@ -405,11 +407,80 @@ redistribution can leave keys that moved across the separator unreachable
 buffer that holds the key moves into the pending writes. No new owned-data
 case.
 
-**Restrictions of step 11a.** In these cases the underfull leaf is not
-rebalanced and stays as it is, which invariant 8 allows. Step 11b lifts them:
+**Restrictions of step 11a (lifted by 11b).** Step 11a left the underfull
+leaf as it was in these cases: a merge that would leave a non-root parent
+without cells, a redistribution whose new separator does not fit in the
+parent, and any work above the parent of the leaf (no check of the parent for
+underflow, no collapse at height 3 or more). Step 11b handles all of them.
 
-- a merge that would leave a non-root parent without cells;
-- a redistribution whose new separator does not fit in the parent;
-- any work above the parent of the leaf: after a merge the parent is not
-  checked for underflow, so it can stay underfull (but it always keeps at
-  least one cell), and there is no collapse at height 3 or more.
+### Step 11b (2026-11-25): internal nodes
+
+**Upward propagation.** After a merge the parent has lost a cell. If the
+parent is not the root and is underfull (the same byte rule, `used * 4 < U`),
+it is rebalanced with a sibling of the same parent, using the next breadcrumb
+up, and the walk goes on while the node above is underfull and not the root.
+After a redistribution the parent kept its cell count and the walk stops. The
+whole walk is planned in memory: the buffer of the node that may be underfull
+is carried upward, and at each level the parent must lead to that node
+(`CorruptTree` otherwise, and also for a parent with no cells). A non-root
+internal node may have no cells only while it is being rebalanced: the parent
+of a pair always has at least one cell, so a sibling always exists.
+
+**Internal merge.** Let `left` and `right` be two sibling internal nodes and
+`K` the separator between them in the parent. They merge if
+`used(left) + used(right) + (4 + len(K) + 4) <= U`, the last term being the
+cell that `K` becomes (child pointer, key and slot). The separator is pulled
+down: the merged node holds the cells of `left`, then `K` with the rightmost
+child of `left` as its child, then the cells of `right`, and the rightmost
+child of `right`. The left page keeps its id and the right page is freed. The
+parent removes the separator cell and the pointer after it leads to the left
+page, as for leaves.
+
+**Internal rotation.** Otherwise the cells of both nodes and `K` are one
+sequence of `n = lc + 1 + rc` cells (the child of `K` is the rightmost child
+of `left`). The cut `m` is chosen by bytes with the rule of an internal split
+(the smallest `m` whose left part has at least half of the bytes, `m` in
+`1..=n-2`). The cells `0..m` stay in the left page with the child of cell `m`
+as rightmost child, the cells `m+1..n` go to the right page with the old
+rightmost child of `right`, and the key of cell `m` goes up as the new
+separator. It stays in neither node, like in a split. No child page moves:
+only the pointers change. The new separator is copied into one owned
+`Vec<u8>` (amendment 1), for the same reason as before: the buffers that hold
+the key move into the pending writes. No new owned-data case.
+
+**Separator that does not fit.** The new separator of a redistribution or a
+rotation can be longer than the one it replaces (keys have variable length).
+If the parent has no room for it, the parent is split in memory with the
+rule of a `put` (the combined cells are the parent without the old cell and
+the new one, whose left child is the left page of the pair), and the split
+goes up through the breadcrumbs above the parent, like `propagate_split`. This
+can allocate pages during a `delete` and, if the split reaches the root, add
+one level to the tree (the root keeps its page id, as in `put`). A node that
+overflowed is not underfull, so the rebalancing walk ends there.
+
+**Root collapse at any height.** If a merge leaves the root with no cells, the
+merged child, a leaf or an internal node, is copied into the root page and
+both pair pages are freed. The root page id does not change, and the tree
+loses one level. A delete collapses the root at most once, because the walk
+ends at the root.
+
+**Invariant 8 after 11b.** After every operation a non-root leaf is not empty,
+every internal node has at least one cell, and only a root leaf may be empty.
+No minimum fill is guaranteed: right-only appends and the root can leave nodes
+underfull, and a node is rebalanced only when a delete touches it or a child
+of it. Deleting every key of a tree ends with an empty root leaf (same page
+id) and every other page free. The cursor still skips empty leaves, because a
+root leaf may be empty and because files written by step 10 code can contain
+empty leaves.
+
+**Write order and crash windows.** As in 11a, the order is: new pages (only in
+the parent split path: the new right halves and, if the root splits, the two
+pages under it), then the changed pages bottom-up (the pair, the parents that
+merged, the root last), then the emptied pages are freed after every write
+succeeded, and the value's overflow chain last. A crash can leak pages but
+nothing points to a freed page. The windows of 11a stay: between the writes
+of the pair and of the parent, keys that moved across a separator can be
+unreachable. In the parent split path there is one more window: the new
+right half of the parent exists but nothing points to it until the pages
+above are written, and the pair pages are already rewritten. None of this can
+be repaired without the WAL (Phase 3).

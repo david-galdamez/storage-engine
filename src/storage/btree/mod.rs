@@ -14,7 +14,8 @@
 //! - [`overflow`](self::overflow): overflow page views and chain read, write and free.
 //! - [`cursor`](self::cursor): [`cursor::Cursor`] and a re-export of
 //!   [`Direction`](crate::storage::engine::Direction), range scans.
-//! - `rebalance`: leaf merge, redistribution and root collapse after a delete.
+//! - `rebalance`: merge, redistribution, parent split and root collapse of leaves
+//!   and internal nodes after a delete.
 //! - [`tree`](self::tree): [`tree::BTree`], the handle of one tree.
 //! - [`engine`](self::engine): [`engine::BTreeEngine`], the `StorageEngine` implementation.
 //! - [`error`](self::error): [`error::NodeError`] and [`error::BTreeError`].

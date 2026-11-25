@@ -1,6 +1,6 @@
-//! Tests for `BTree::delete` (Phase 2, step 10): the delete itself. Since step 11a an
-//! underfull leaf is rebalanced, so the tests that empty leaves allow merged
-//! leaves.
+//! Tests for `BTree::delete` (Phase 2, step 10): the delete itself. Since steps
+//! 11a and 11b underfull nodes are rebalanced and the tree shrinks, so the
+//! tests that empty leaves allow merged leaves and a collapsed tree.
 //! Page size is 512 bytes.
 //!
 //! The tests check:
@@ -12,11 +12,13 @@
 //! - deleting an overflow value frees its whole chain, the free list stays
 //!   valid, no page leaks, and the freed pages are reused by the next large
 //!   value;
-//! - deleting every key of a three-level tree leaves the same height, the
-//!   leaves that remain in the same order, no leaked page, and every scan is
+//! - deleting every key of a three-level tree collapses it to an empty root
+//!   leaf (same page id), with every other page free, and every scan is
 //!   empty;
 //! - emptying the first, a middle and the last leaf: scans that start where
 //!   its keys were match the model in both directions;
+//! - leaves emptied by hand, like the ones that step 10 code left in a file:
+//!   scans skip them in both directions;
 //! - deleting a key that is a separator in the root and putting it back;
 //! - refilling an emptied leaf until it splits;
 //! - a corrupt overflow chain: the delete fails after the leaf was written,
@@ -33,6 +35,8 @@ mod db;
 mod leaks;
 #[path = "support/lookup.rs"]
 mod lookup;
+#[path = "support/non_empty.rs"]
+mod non_empty;
 #[path = "support/shape.rs"]
 mod shape;
 
@@ -44,6 +48,7 @@ use btree_check::{Entries, check_tree, leaf_chain};
 use db::{new_pager, temp_db};
 use leaks::ensure_no_leaks;
 use lookup::{ensure_missing, ensure_value, get};
+use non_empty::check_non_empty;
 use proptest::prelude::*;
 use shape::{blank, height, numbered_entries};
 use storage_engine_rs::storage::btree::error::BTreeError;
@@ -353,9 +358,8 @@ fn delete_every_key_of_a_three_level_tree() -> anyhow::Result<()> {
     let mut pager = new_pager(&path)?;
     let count = 1000;
     let (tree, entries) = put_tree(&mut pager, count)?;
-    let levels = height(&pager, tree.root())?;
-    ensure!(levels >= 3, "tree is too shallow");
-    let leaves = leaf_chain(&pager, tree)?;
+    let root = tree.root();
+    ensure!(height(&pager, root)? >= 3, "tree is too shallow");
 
     for step in 0..count {
         let (key, _) = entries.get(scramble(step, count)?).context("entry")?;
@@ -365,14 +369,15 @@ fn delete_every_key_of_a_three_level_tree() -> anyhow::Result<()> {
     for (key, _) in &entries {
         ensure_missing(get(tree, &pager, key)?.as_deref(), "deleted key")?;
     }
-    ensure!(height(&pager, tree.root())? == levels, "height changed");
-    // Leaves are merged now (step 11a), so some of them are gone, and the
-    // others keep their order.
-    ensure!(
-        is_subsequence(&leaf_chain(&pager, tree)?, &leaves),
-        "leaf chain changed"
-    );
+    // Every merge and collapse (steps 11a and 11b) leaves one empty root leaf
+    // with the same page id, and every other page is free.
+    ensure!(tree.root() == root, "root id changed");
+    ensure!(height(&pager, root)? == 1, "the tree did not collapse");
+    ensure!(leaf_chain(&pager, tree)? == [root], "leaf chain");
     ensure!(check_tree(&pager, tree)?.is_empty(), "entries left");
+    check_non_empty(&pager, tree)?;
+    let others = pager.page_count().checked_sub(2).context("pages")?;
+    ensure!(others == pager.free_page_count(), "pages are not free");
     ensure_no_leaks(&pager, tree)?;
     for (lower, upper) in bound_pairs(b"key-00100", b"key-00900") {
         check_range(tree, &pager, &BTreeMap::new(), &lower, &upper)?;
@@ -411,6 +416,7 @@ fn empty_leaf_at(position: Position) -> anyhow::Result<()> {
     );
     let remaining: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     ensure!(check_tree(&pager, tree)? == remaining, "check_tree");
+    check_non_empty(&pager, tree)?;
 
     let first = doomed.first().context("first")?;
     let last = doomed.last().context("last")?;
@@ -455,6 +461,55 @@ fn an_emptied_middle_leaf_is_skipped_by_scans() -> anyhow::Result<()> {
 #[test]
 fn an_emptied_last_leaf_is_skipped_by_scans() -> anyhow::Result<()> {
     empty_leaf_at(Position::Last)
+}
+
+/// Rewrites the leaf at `position` of a 1000-entry tree as an empty leaf that
+/// is still linked and still has its separators in the parents: the shape that
+/// `delete` of step 10 left in a file. The cursor must skip it.
+fn hand_emptied_leaf_at(position: Position) -> anyhow::Result<()> {
+    let (_dir, path) = temp_db()?;
+    let mut pager = new_pager(&path)?;
+    let (tree, entries) = put_tree(&mut pager, 1000)?;
+    let leaves = leaf_chain(&pager, tree)?;
+    let index = match position {
+        Position::First => 0,
+        Position::Middle => leaves.len() / 2,
+        Position::Last => leaves.len().checked_sub(1).context("no leaves")?,
+    };
+    let target = *leaves.get(index).context("leaf")?;
+    let doomed = leaf_keys(&pager, target)?;
+    ensure!(doomed.len() > 1, "the leaf has {} keys", doomed.len());
+
+    let next = LeafNode::new(&read(&pager, target)?)?.next_leaf()?;
+    let mut buf = blank();
+    LeafNodeMut::init(&mut buf)?;
+    LeafNodeMut::new(&mut buf)?.set_next_leaf(next)?;
+    pager.write_page(target, &mut buf)?;
+
+    let mut model = model_of(&entries);
+    for key in &doomed {
+        model.remove(key);
+    }
+    ensure!(leaf_chain(&pager, tree)? == leaves, "leaf chain");
+    ensure!(leaf_keys(&pager, target)?.is_empty(), "leaf is not empty");
+    let remaining: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    ensure!(check_tree(&pager, tree)? == remaining, "check_tree");
+
+    let first = doomed.first().context("first")?;
+    let last = doomed.last().context("last")?;
+    for (low, high) in [(first, last), (last, last), (first, first)] {
+        for (lower, upper) in bound_pairs(low, high) {
+            check_range(tree, &pager, &model, &lower, &upper)?;
+        }
+    }
+    check_range(tree, &pager, &model, &Unbounded, &Unbounded)
+}
+
+#[test]
+fn scans_skip_a_hand_emptied_first_middle_and_last_leaf() -> anyhow::Result<()> {
+    hand_emptied_leaf_at(Position::First)?;
+    hand_emptied_leaf_at(Position::Middle)?;
+    hand_emptied_leaf_at(Position::Last)
 }
 
 #[test]
@@ -602,6 +657,7 @@ fn run_model(keys: &[Vec<u8>], ops: &[Op], bounds: &[(Spec, Spec)]) -> anyhow::R
     }
 
     let all: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    check_non_empty(&pager, tree)?;
     let (_, entries) = ensure_no_leaks(&pager, tree)?;
     ensure!(entries == all, "entries differ from the model");
     check_range(tree, &pager, &model, &Unbounded, &Unbounded)?;
