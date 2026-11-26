@@ -28,8 +28,8 @@ use crate::storage::btree::{
     error::BTreeError,
     internal::InternalNode,
     leaf::LeafNode,
-    node::LeafCell,
-    tree::{BTree, Crumb, MAX_TREE_HEIGHT, Path, Target, page_buffer},
+    node::{LeafCell, page_buffer},
+    tree::{BTree, Crumb, MAX_TREE_HEIGHT, Path, Target},
 };
 use crate::storage::pager::{
     disk::Pager,

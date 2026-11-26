@@ -36,9 +36,9 @@ use crate::storage::btree::{
     error::{BTreeError, NodeError, Violation},
     internal::InternalNode,
     leaf::LeafNode,
-    node::{ValueRef, fits_inline, max_key_len},
+    node::{ValueRef, fits_inline, max_key_len, page_buffer},
     overflow::{OverflowPage, overflow_capacity},
-    tree::{BTree, MAX_TREE_HEIGHT, page_buffer},
+    tree::{BTree, MAX_TREE_HEIGHT},
 };
 use crate::storage::pager::{
     disk::Pager,

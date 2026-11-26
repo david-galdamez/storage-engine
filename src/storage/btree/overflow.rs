@@ -28,8 +28,7 @@ use std::ops::Range;
 
 use crate::storage::btree::{
     error::{BTreeError, NodeError},
-    node::{ValueRef, page_size_of},
-    tree::page_buffer,
+    node::{ValueRef, page_buffer, page_size_of},
 };
 use crate::storage::pager::{
     codec::{read_u32, slice, write_bytes, write_u32},

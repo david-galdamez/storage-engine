@@ -47,10 +47,12 @@ use crate::storage::btree::{
     error::{BTreeError, NodeError},
     internal::{InternalNode, InternalNodeMut},
     leaf::{LeafNode, LeafNodeMut},
-    node::{INTERNAL_CELL_HEADER_SIZE, LeafCell, min_node_fill, page_size_of, usable_space},
+    node::{
+        INTERNAL_CELL_HEADER_SIZE, LeafCell, min_node_fill, page_buffer, page_size_of, usable_space,
+    },
     tree::{
         CellSequence, Crumb, InternalSequence, InternalTarget, Path, Pending, build_halves,
-        choose_internal_split, choose_split, fill_internal, page_buffer, split_parent,
+        choose_internal_split, choose_split, fill_internal, split_parent,
     },
 };
 use crate::storage::pager::{

@@ -1,4 +1,5 @@
-//! Size limits and the leaf cell codec shared by the node views.
+//! Size limits, page buffer helpers and the leaf cell codec shared by the
+//! node views.
 //!
 //! A B+Tree node is a slotted page (ADR 0003) whose type byte is 4 (leaf) or 5
 //! (internal) and whose bytes 24..32 are node specific (ADR 0005):
@@ -31,6 +32,7 @@ use std::cmp::Ordering;
 use crate::storage::btree::error::NodeError;
 use crate::storage::pager::{
     codec::{read_u8, read_u16, read_u32, slice, write_bytes, write_u8, write_u16, write_u32},
+    disk::Pager,
     error::PageError,
     slotted::{SLOT_SIZE, SLOTTED_HEADER_SIZE},
     types::{PageId, PageSize},
@@ -254,6 +256,12 @@ pub(crate) fn internal_cell_key(cell: &[u8]) -> Result<&[u8], NodeError> {
         .ok_or(NodeError::CorruptNode {
             reason: "internal cell shorter than its child pointer",
         })
+}
+
+/// Allocates a zeroed buffer of one page, owned by the caller (ADR 0005,
+/// option 7, until the buffer pool exists).
+pub(crate) fn page_buffer(pager: &Pager) -> Vec<u8> {
+    vec![0u8; pager.page_size().as_usize()]
 }
 
 /// Returns the page size of `buffer`, based on its length.

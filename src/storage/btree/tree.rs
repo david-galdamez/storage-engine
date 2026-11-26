@@ -30,6 +30,7 @@ use crate::storage::btree::{
     leaf::{LeafNode, LeafNodeMut},
     node::{
         INTERNAL_CELL_HEADER_SIZE, LeafCell, ValueRef, fits_inline, leaf_cell_len, max_key_len,
+        page_buffer,
     },
     overflow::{free_chain, read_value, write_chain},
     rebalance::rebalance_leaf,
@@ -615,12 +616,6 @@ fn free_old_chain(pager: &mut Pager, old_chain: Option<(u32, PageId)>) -> Result
         Some((len, first_page)) => free_chain(pager, len, first_page),
         None => Ok(()),
     }
-}
-
-/// Allocates a zeroed buffer of one page, owned by the caller (ADR 0005,
-/// option 7, until the buffer pool exists).
-pub(crate) fn page_buffer(pager: &Pager) -> Vec<u8> {
-    vec![0u8; pager.page_size().as_usize()]
 }
 
 /// Pages planned by a split. Nothing is written until the whole split is
