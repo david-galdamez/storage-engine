@@ -290,6 +290,27 @@ fn internal_node_without_cells_is_a_violation() -> anyhow::Result<()> {
 }
 
 #[test]
+fn a_tree_deeper_than_the_maximum_height_is_too_deep() -> anyhow::Result<()> {
+    // `MAX_TREE_HEIGHT` (src/storage/btree/tree.rs) is 33 and not public, so
+    // build 40 levels, comfortably past it.
+    const LEVELS: usize = 40;
+    let (_dir, path) = temp_db()?;
+    let mut pager = new_pager(&path)?;
+    let mut child = write_leaf(&mut pager, &[(&[0], b"1")], None)?;
+    // Separators grow outward (2, 4, ...), so every subtree stays inside the
+    // bounds of its ancestors. The deep chain is the leftmost child, so the
+    // walk descends it first.
+    for sep in (2u8..).step_by(2).take(LEVELS) {
+        let right = write_leaf(&mut pager, &[(&[sep], b"2")], None)?;
+        child = write_internal(&mut pager, &[(child, &[sep])], right)?;
+    }
+    let tree = BTree::open(&pager, child)?;
+    let found = violation(verify_tree(&pager, tree))?;
+    ensure!(found == Violation::TooDeep, "{found:?}");
+    Ok(())
+}
+
+#[test]
 fn two_parents_of_one_child_is_a_reached_twice_violation() -> anyhow::Result<()> {
     let (_dir, path) = temp_db()?;
     let mut pager = new_pager(&path)?;
