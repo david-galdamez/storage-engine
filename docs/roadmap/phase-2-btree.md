@@ -6,11 +6,15 @@ primary tree per model (`_id` → document) and one tree per secondary index
 (encoded field value + `_id` → empty value). Each tree is identified by its
 root page id.
 
+Related decisions: [ADR 0005](../decisions/0005-btree-node-format.md) (node
+format, with amendments 1–4: owned separator, engine scan, rebalancing,
+verification).
+
 Out of scope: WAL and crash recovery (Phase 3; a crash during a split can
 corrupt a tree until then), buffer pool (Phase 4), the catalog itself
 (Phase 6; this phase only reserves its root in the file header), concurrency
 control, order-preserving key encoding for document types (Phases 5 and 8),
-right-only append optimization, prefix and suffix compression.
+prefix and suffix compression.
 
 Reading (_Database Internals_): Ch. 2 B-Tree Basics (lookups, node splits,
 node merges); Ch. 4 Implementing B-Trees (page header, sibling links,
@@ -64,7 +68,23 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 12c | Model tests                   | Model tests against a BTreeMap, one and many trees per file                            | —                                                              | Done    |
 | 13a | REPL on the B+Tree file       | REPL data persists in a B+Tree file; tree fixed at page 1 until the catalog (Phase 6)  | —                                                              | Done    |
 | 13b | Remove the in-memory store    | Delete the temporary in-memory `Storage` once the REPL uses the B+Tree                 | —                                                              | Done    |
-| 13c | verify command                | REPL command that runs `verify_file` on the database file                              | —                                                              | Done |
-| 14  | Docs                          | Update README roadmap, ADRs and this file                                              | —                                                              | Planned |
+| 13c | verify command                | REPL command that runs `verify_file` on the database file                              | —                                                              | Done    |
+| 14  | Docs                          | Update README roadmap, ADRs and this file                                              | —                                                              | Done    |
 
 One commit per step on `feat/btree`.
+
+## Known limits and follow-ups
+
+- No WAL until Phase 3: a crash during a split, a merge or an overflow write
+  can leak pages or leave keys unreachable (ADR 0005, Amendment 3, step 11b,
+  paragraph "Write order and crash windows").
+- The REPL tree is fixed at page 1 until the catalog exists (Phase 6), so the
+  REPL cannot open a file whose page 1 is not a tree root.
+- Page buffers are owned `Vec<u8>` (`page_buffer`) until the buffer pool
+  (Phase 4); revisit Amendment 1 (owned separator) then.
+- `verify_file` tracks seen pages in a `HashSet`, fine for test-sized files;
+  switch to a bitmap for large files.
+- `Violation::KeyTooLarge` has no test: the public API cannot build such a tree
+  (see the header of `tests/btree_verify.rs`).
+- No minimum fill is guaranteed: underfull nodes are valid (ADR 0005,
+  invariant 8).

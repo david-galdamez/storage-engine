@@ -484,3 +484,14 @@ unreachable. In the parent split path there is one more window: the new
 right half of the parent exists but nothing points to it until the pages
 above are written, and the pair pages are already rewritten. None of this can
 be repaired without the WAL (Phase 3).
+
+## Amendment 4 (2026-11-26): verification
+
+`verify_tree` checks invariants 2, 3, 4, 6, 7 and 8, the slotted page rules of
+every node, `max_key_len`, a height bound of `MAX_TREE_HEIGHT`, and that no
+page is reached twice. `verify_file` also checks the free list and that every
+page of the file belongs to exactly one tree or to the free list. Underfull is
+not a violation: invariant 8 guarantees no minimum fill, so trees built by
+right-only appends are valid. Until the WAL exists, `verify` cannot find
+everything a crash leaves behind; it does report leaked pages through
+`verify_file`.
