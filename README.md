@@ -121,6 +121,7 @@ $ set <key> <value>
 $ get <key>
 $ delete <key>
 $ scan
+$ verify
 $ exit
 ```
 

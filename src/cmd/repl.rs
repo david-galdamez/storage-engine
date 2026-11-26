@@ -5,7 +5,7 @@ use std::path::Path;
 use clap::Parser;
 
 use storage_engine_rs::storage::{
-    btree::{BTree, BTreeEngine, error::BTreeError},
+    btree::{BTree, BTreeEngine, error::BTreeError, verify_file},
     engine::{Direction, EngineCursor, StorageEngine},
     pager::{
         disk::{Pager, PagerOptions},
@@ -134,6 +134,14 @@ fn response(
                     String::from_utf8_lossy(&value)
                 )?;
             }
+        }
+        commands::Command::Verify => {
+            let stats = verify_file(engine.pager(), &[tree])?;
+            writeln!(
+                out,
+                "OK height={} entries={} node_pages={} overflow_pages={}",
+                stats.height, stats.entries, stats.node_pages, stats.overflow_pages
+            )?;
         }
         commands::Command::Exit => {
             return Ok(true);
@@ -265,6 +273,33 @@ mod tests {
             &run_line("scan", &mut engine, tree)?.1,
             &"a : 1\nb : 2\nc : 3\n",
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_reports_entries() -> ReplResult<()> {
+        let (_dir, mut engine, tree) = open_temp()?;
+        check_eq(
+            &run_line("verify", &mut engine, tree)?.1,
+            &"OK height=1 entries=0 node_pages=1 overflow_pages=0\n",
+        )?;
+        for line in ["set a 1", "set b 2", "set c 3"] {
+            run_line(line, &mut engine, tree)?;
+        }
+        check_eq(
+            &run_line("verify", &mut engine, tree)?.1,
+            &"OK height=1 entries=3 node_pages=1 overflow_pages=0\n",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn verify_counts_overflow_pages() -> ReplResult<()> {
+        let (_dir, mut engine, tree) = open_temp()?;
+        run_line(&format!("set big {}", "x".repeat(5000)), &mut engine, tree)?;
+        let text = run_line("verify", &mut engine, tree)?.1;
+        check_eq(&text.contains("entries=1 "), &true)?;
+        check_eq(&text.contains("overflow_pages=0"), &false)?;
         Ok(())
     }
 
