@@ -2,6 +2,7 @@
 
 use crate::storage::pager::{
     error::{PageError, PagerError},
+    page::PageType,
     types::PageId,
 };
 
@@ -88,6 +89,11 @@ pub enum Violation {
     /// and as an overflow page (invariant 7).
     #[error("page reached twice")]
     PageReachedTwice,
+
+    /// A page reached from the tree is not a B+Tree node. Field `found` is its
+    /// page type.
+    #[error("page is not a B+Tree node, found page type: {found}")]
+    NotANode { found: PageType },
 
     /// A descent is deeper than any valid tree.
     #[error("tree deeper than the maximum height")]

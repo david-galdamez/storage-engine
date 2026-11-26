@@ -40,7 +40,11 @@ use crate::storage::btree::{
     overflow::{OverflowPage, overflow_capacity},
     tree::{BTree, MAX_TREE_HEIGHT, page_buffer},
 };
-use crate::storage::pager::{disk::Pager, types::PageId};
+use crate::storage::pager::{
+    disk::Pager,
+    page::{PageType, page_type},
+    types::PageId,
+};
 
 /// Counts from one walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -137,7 +141,14 @@ fn walk(
     pager.read_page(id, &mut buf)?;
     bump(&mut state.stats.node_pages);
 
-    if let Ok(node) = InternalNode::new(&buf) {
+    let is_internal = match page_type(&buf) {
+        Ok(PageType::BTreeInternal) => true,
+        Ok(PageType::BTreeLeaf) => false,
+        Ok(found) => return Err(invariant(id, Violation::NotANode { found })),
+        Err(e) => return Err(node_err(id)(e.into())),
+    };
+    if is_internal {
+        let node = InternalNode::new(&buf).map_err(node_err(id))?;
         node.validate().map_err(node_err(id))?;
         let count = node.cell_count();
         if count == 0 {
@@ -292,8 +303,8 @@ fn verify_one(
 /// # Errors
 ///
 /// Returns [`BTreeError::Invariant`] with the page and the rule that failed,
-/// [`BTreeError::Node`] if a page does not decode (including a page of the
-/// wrong type), and [`BTreeError::Pager`] if a read fails.
+/// [`BTreeError::Node`] if a page does not decode (including an unknown page
+/// type byte), and [`BTreeError::Pager`] if a read fails.
 pub fn verify_tree(pager: &Pager, tree: BTree) -> Result<TreeStats, BTreeError> {
     verify_one(pager, tree, &mut HashSet::new())
 }

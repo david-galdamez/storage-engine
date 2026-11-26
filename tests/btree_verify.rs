@@ -24,15 +24,16 @@ mod db;
 mod shape;
 
 use anyhow::{Context, ensure};
-use build::{bulk_load, write_internal, write_leaf};
+use build::{bulk_load, write_internal, write_internal_at, write_leaf};
 use db::{new_pager, temp_db};
 use shape::{blank, height, numbered_entries};
-use storage_engine_rs::storage::btree::error::{BTreeError, Violation};
+use storage_engine_rs::storage::btree::error::{BTreeError, NodeError, Violation};
 use storage_engine_rs::storage::btree::leaf::{LeafNode, LeafNodeMut};
 use storage_engine_rs::storage::btree::node::ValueRef;
 use storage_engine_rs::storage::btree::overflow::{OverflowPage, OverflowPageMut};
 use storage_engine_rs::storage::btree::{BTree, verify_file, verify_tree};
 use storage_engine_rs::storage::pager::disk::Pager;
+use storage_engine_rs::storage::pager::page::PageType;
 use storage_engine_rs::storage::pager::types::PageId;
 
 /// Asserts that `result` is an `Invariant` error and returns its violation.
@@ -410,4 +411,44 @@ fn trees_sharing_a_child_are_a_reached_twice_violation() -> anyhow::Result<()> {
     let found = violation(verify_file(&pager, &[t1, t2]))?;
     ensure!(found == Violation::PageReachedTwice, "{found:?}");
     Ok(())
+}
+
+#[test]
+fn internal_node_with_keys_out_of_order_is_a_node_error() -> anyhow::Result<()> {
+    let (_dir, path) = temp_db()?;
+    let mut pager = new_pager(&path)?;
+    let a = write_leaf(&mut pager, &[(b"a", b"1")], None)?;
+    let b = write_leaf(&mut pager, &[(b"m", b"1")], None)?;
+    let c = write_leaf(&mut pager, &[(b"z", b"1")], None)?;
+    let root = write_internal(&mut pager, &[(a, b"z"), (b, b"m")], c)?;
+    let tree = BTree::open(&pager, root)?;
+    match verify_tree(&pager, tree) {
+        Err(BTreeError::Node {
+            page,
+            source: NodeError::CorruptNode { .. },
+        }) if page == root => Ok(()),
+        other => anyhow::bail!("unexpected result: {other:?}"),
+    }
+}
+
+#[test]
+fn child_that_is_not_a_node_is_reported_with_its_found_type() -> anyhow::Result<()> {
+    let (_dir, path) = temp_db()?;
+    let mut pager = new_pager(&path)?;
+    let leaf = write_leaf(&mut pager, &[(b"a", b"1")], None)?;
+    // Allocate the root first so that `write_internal` does not reuse the freed page.
+    let root = pager.allocate_page()?;
+    let freed = pager.allocate_page()?;
+    pager.free_page(freed)?;
+    write_internal_at(&mut pager, root, &[(leaf, b"m")], freed)?;
+    let tree = BTree::open(&pager, root)?;
+    match verify_tree(&pager, tree) {
+        Err(BTreeError::Invariant {
+            page,
+            violation: Violation::NotANode {
+                found: PageType::Free,
+            },
+        }) if page == freed => Ok(()),
+        other => anyhow::bail!("unexpected result: {other:?}"),
+    }
 }
