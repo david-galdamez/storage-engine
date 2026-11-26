@@ -63,7 +63,7 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 12b | Test checkers                 | Test checkers backed by verify_tree                                                    | —                                                              | Done    |
 | 12c | Model tests                   | Model tests against a BTreeMap, one and many trees per file                            | —                                                              | Done    |
 | 13a | REPL on the B+Tree file       | REPL data persists in a B+Tree file; tree fixed at page 1 until the catalog (Phase 6)  | —                                                              | Done    |
-| 13b | Remove the in-memory store    | Delete the temporary in-memory `Storage` once the REPL uses the B+Tree                 | —                                                              | Planned |
+| 13b | Remove the in-memory store    | Delete the temporary in-memory `Storage` once the REPL uses the B+Tree                 | —                                                              | Done    |
 | 13c | verify command                | REPL command that runs `verify_file` on the database file                              | —                                                              | Planned |
 | 14  | Docs                          | Update README roadmap, ADRs and this file                                              | —                                                              | Planned |
 
