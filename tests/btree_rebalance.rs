@@ -675,7 +675,7 @@ fn a_separator_that_does_not_fit_in_the_parent_splits_it() -> anyhow::Result<()>
         (n2.as_slice(), b"abc"),
         (n3.as_slice(), b"abc"),
     ];
-    let tail_keys: Vec<Vec<u8>> = [b'q', b'r', b's', b't'].into_iter().map(long).collect();
+    let tail_keys: Vec<Vec<u8>> = b"qrst".iter().copied().map(long).collect();
     // Leaves to the right of `l2`, one per long separator of the root.
     let tail = leaf_run(&mut pager, &tail_keys, None)?;
     let l2 = write_leaf(&mut pager, &l2_entries, tail.first().copied())?;
