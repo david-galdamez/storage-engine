@@ -110,10 +110,11 @@ Requirements: a recent stable Rust toolchain (edition 2024).
 
 ```bash
 cargo build
-cargo run          # starts the test REPL
+cargo run -- [path]   # starts the test REPL (default file: repl.db)
 ```
 
-REPL commands (Phase 0, in-memory only):
+REPL commands. Data is stored in a B+Tree file (`repl.db` by default, or the
+path given as argument) and persists between runs:
 
 ```
 $ set <key> <value>

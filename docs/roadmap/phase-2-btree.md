@@ -62,7 +62,9 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 12a | verify_tree / verify_file     | Typed invariant checks for one tree and a whole file                                   | Ch. 2; Ch. 4 Sibling Links, Overflow Pages                    | Done    |
 | 12b | Test checkers                 | Test checkers backed by verify_tree                                                    | —                                                              | Done    |
 | 12c | Model tests                   | Model tests against a BTreeMap, one and many trees per file                            | —                                                              | Done    |
-| 13  | REPL on the B+Tree            | The test REPL stores its data in a B+Tree file                                         | —                                                              | Planned |
+| 13a | REPL on the B+Tree file       | REPL data persists in a B+Tree file; tree fixed at page 1 until the catalog (Phase 6)  | —                                                              | Done    |
+| 13b | Remove the in-memory store    | Delete the temporary in-memory `Storage` once the REPL uses the B+Tree                 | —                                                              | Planned |
+| 13c | verify command                | REPL command that runs `verify_file` on the database file                              | —                                                              | Planned |
 | 14  | Docs                          | Update README roadmap, ADRs and this file                                              | —                                                              | Planned |
 
 One commit per step on `feat/btree`.
