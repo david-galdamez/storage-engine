@@ -61,7 +61,7 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 11b | Internal rebalancing          | Merge or rotate internal nodes, propagate up, collapse any height, split on delete    | Ch. 2 Node Merges; Ch. 4 Rebalancing                           | Done    |
 | 12a | verify_tree / verify_file     | Typed invariant checks for one tree and a whole file                                   | Ch. 2; Ch. 4 Sibling Links, Overflow Pages                    | Done    |
 | 12b | Test checkers                 | Test checkers backed by verify_tree                                                    | —                                                              | Done    |
-| 12c | Model tests                   | Model tests against a BTreeMap, one and many trees per file                            | —                                                              | Planned |
+| 12c | Model tests                   | Model tests against a BTreeMap, one and many trees per file                            | —                                                              | Done    |
 | 13  | REPL on the B+Tree            | The test REPL stores its data in a B+Tree file                                         | —                                                              | Planned |
 | 14  | Docs                          | Update README roadmap, ADRs and this file                                              | —                                                              | Planned |
 
