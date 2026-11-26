@@ -59,7 +59,9 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 10c | Engine scan                   | Add scan to StorageEngine: a GAT cursor that lends keys and copies values on request   | —                                                              | Done    |
 | 11a | Leaf rebalancing              | Merge and redistribute underfull leaves, collapse a height-2 root, free empty pages   | Ch. 2 Node Merges; Ch. 4 Rebalancing                           | Done    |
 | 11b | Internal rebalancing          | Merge or rotate internal nodes, propagate up, collapse any height, split on delete    | Ch. 2 Node Merges; Ch. 4 Rebalancing                           | Done    |
-| 12  | Verification and model tests  | `verify_tree` invariants; property tests against a `BTreeMap` model, many trees per file | —                                                            | Planned |
+| 12a | verify_tree / verify_file     | Typed invariant checks for one tree and a whole file                                   | Ch. 2; Ch. 4 Sibling Links, Overflow Pages                    | Done    |
+| 12b | Test checkers                 | Test checkers backed by verify_tree                                                    | —                                                              | Planned |
+| 12c | Model tests                   | Model tests against a BTreeMap, one and many trees per file                            | —                                                              | Planned |
 | 13  | REPL on the B+Tree            | The test REPL stores its data in a B+Tree file                                         | —                                                              | Planned |
 | 14  | Docs                          | Update README roadmap, ADRs and this file                                              | —                                                              | Planned |
 

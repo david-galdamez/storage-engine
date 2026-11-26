@@ -71,4 +71,87 @@ pub enum BTreeError {
     /// `max` is the limit.
     #[error("Value too large, len: {len} - max: {max}")]
     ValueTooLarge { len: usize, max: usize },
+
+    /// A structural check of [`verify_tree`](crate::storage::btree::verify::verify_tree)
+    /// or [`verify_file`](crate::storage::btree::verify::verify_file) failed.
+    /// Field `page` is the page where the problem was found; field `violation`
+    /// names the rule that failed.
+    #[error("Invariant violated, page_id: {page}, {violation}")]
+    Invariant { page: PageId, violation: Violation },
+}
+
+/// The rule of ADR 0005 that a tree or a file breaks, reported by
+/// [`BTreeError::Invariant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Violation {
+    /// A page is reachable twice: from two parents, from a cycle, or as a node
+    /// and as an overflow page (invariant 7).
+    #[error("page reached twice")]
+    PageReachedTwice,
+
+    /// A descent is deeper than any valid tree.
+    #[error("tree deeper than the maximum height")]
+    TooDeep,
+
+    /// A leaf is at a different depth than the first leaf found (invariant 2).
+    /// Field `depth` is its depth; field `expected` is the depth of the others.
+    #[error("leaf at depth {depth}, other leaves at {expected}")]
+    LeafDepth { depth: usize, expected: usize },
+
+    /// A key is outside the bounds that the separators above it give
+    /// (invariant 4). Field `index` is the cell position.
+    #[error("key {index} outside the bounds given by the parent")]
+    KeyOutOfBounds { index: usize },
+
+    /// A key is longer than `max_key_len`. Field `index` is the cell position.
+    #[error("key {index} is {len} bytes, max {max}")]
+    KeyTooLarge {
+        index: usize,
+        len: usize,
+        max: usize,
+    },
+
+    /// The `next_leaf` of a leaf is not the next leaf of the walk (invariant 6).
+    #[error("next_leaf is {found:?}, expected {expected:?}")]
+    LeafLink {
+        found: Option<PageId>,
+        expected: Option<PageId>,
+    },
+
+    /// A non-root leaf has no cells (invariant 8).
+    #[error("non-root leaf is empty")]
+    EmptyLeaf,
+
+    /// An internal node has no cells, so it has a single child (invariant 8).
+    #[error("internal node has no cells")]
+    EmptyInternal,
+
+    /// A value is inline when it should be in a chain, or the other way round.
+    /// Field `index` is the cell position.
+    #[error("value of cell {index} is stored in the wrong form")]
+    NonCanonicalValue { index: usize },
+
+    /// An overflow page that is not the last of its chain holds less than a
+    /// full page of data.
+    #[error("overflow page is not full but not last")]
+    OverflowNotFull,
+
+    /// The chain of a cell holds a different number of bytes than the cell
+    /// says. Field `index` is the cell position.
+    #[error("overflow chain of cell {index} holds {found} bytes, the cell says {expected}")]
+    OverflowLength {
+        index: usize,
+        expected: u32,
+        found: usize,
+    },
+
+    /// Some pages of the file are in no tree and not on the free list (a leak),
+    /// or in both. `reached` counts the pages of the trees, `free` the free
+    /// list and `total` the pages of the file without the file header.
+    #[error("{reached} pages reached + {free} free, file has {total}")]
+    PageAccounting {
+        reached: usize,
+        free: u32,
+        total: u32,
+    },
 }

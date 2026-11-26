@@ -19,6 +19,8 @@
 //! - [`tree`](self::tree): [`tree::BTree`], the handle of one tree.
 //! - [`engine`](self::engine): [`engine::BTreeEngine`], the `StorageEngine` implementation.
 //! - [`error`](self::error): [`error::NodeError`] and [`error::BTreeError`].
+//! - [`verify`](self::verify): [`verify::verify_tree`] and [`verify::verify_file`],
+//!   whole-tree and whole-file structural checks.
 
 pub mod cursor;
 pub mod engine;
@@ -29,7 +31,10 @@ pub mod node;
 pub mod overflow;
 mod rebalance;
 pub mod tree;
+pub mod verify;
 
 pub use cursor::{Cursor, Direction};
 pub use engine::{BTreeEngine, BTreeScan};
+pub use error::Violation;
 pub use tree::BTree;
+pub use verify::{TreeStats, verify_file, verify_tree};
