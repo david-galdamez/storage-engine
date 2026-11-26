@@ -3,7 +3,7 @@
 //! The byte layout is documented in `src/storage/pager/page.rs` and in
 //! ADR 0003. These tests check the behavior the rest of the pager relies on:
 //!
-//! - `PageType` round-trips through `u8`. Only 1, 2 and 3 are valid, so a
+//! - `PageType` round-trips through `u8`. Only 1 to 6 are valid, so a
 //!   zero-filled page is never taken for a real one.
 //! - Each setter writes only its own field, in little-endian.
 //! - The checksum is the CRC32 of `[4, len)`, stored at `[0, 4)`. Any changed
@@ -77,11 +77,21 @@ fn page_type_to_byte_matches_adr() {
     assert_eq!(u8::from(PageType::FileHeader), 1);
     assert_eq!(u8::from(PageType::Free), 2);
     assert_eq!(u8::from(PageType::Slotted), 3);
+    assert_eq!(u8::from(PageType::BTreeLeaf), 4);
+    assert_eq!(u8::from(PageType::BTreeInternal), 5);
+    assert_eq!(u8::from(PageType::Overflow), 6);
 }
 
 #[test]
 fn page_type_from_byte_round_trips() -> anyhow::Result<()> {
-    for page_type in [PageType::FileHeader, PageType::Free, PageType::Slotted] {
+    for page_type in [
+        PageType::FileHeader,
+        PageType::Free,
+        PageType::Slotted,
+        PageType::BTreeLeaf,
+        PageType::BTreeInternal,
+        PageType::Overflow,
+    ] {
         let back = PageType::try_from(u8::from(page_type))?;
         ensure!(back == page_type, "{page_type:?} came back as {back:?}");
     }
@@ -90,10 +100,10 @@ fn page_type_from_byte_round_trips() -> anyhow::Result<()> {
 
 #[test]
 fn page_type_rejects_every_unknown_byte() {
-    // Checks all 256 values: only 1, 2 and 3 are valid.
+    // Checks all 256 values: only 1 to 6 are valid.
     for value in 0..=u8::MAX {
         let result = PageType::try_from(value);
-        if (1..=3).contains(&value) {
+        if (1..=6).contains(&value) {
             assert!(result.is_ok(), "{value} should be accepted");
         } else {
             assert!(
@@ -102,6 +112,38 @@ fn page_type_rejects_every_unknown_byte() {
             );
         }
     }
+}
+
+#[test]
+fn has_slotted_layout_is_true_only_for_slotted_and_btree_nodes() {
+    assert!(!PageType::FileHeader.has_slotted_layout());
+    assert!(!PageType::Free.has_slotted_layout());
+    assert!(PageType::Slotted.has_slotted_layout());
+    assert!(PageType::BTreeLeaf.has_slotted_layout());
+    assert!(PageType::BTreeInternal.has_slotted_layout());
+    assert!(!PageType::Overflow.has_slotted_layout());
+}
+
+#[test]
+fn page_type_display_names_the_new_types() {
+    assert_eq!(PageType::BTreeLeaf.to_string(), "B+Tree Leaf");
+    assert_eq!(PageType::BTreeInternal.to_string(), "B+Tree Internal");
+    assert_eq!(PageType::Overflow.to_string(), "Overflow");
+}
+
+#[test]
+fn set_page_type_writes_the_new_bytes() -> anyhow::Result<()> {
+    for (kind, byte) in [
+        (PageType::BTreeLeaf, 4u8),
+        (PageType::BTreeInternal, 5),
+        (PageType::Overflow, 6),
+    ] {
+        let mut buf = vec![0u8; 512];
+        set_page_type(&mut buf, kind)?;
+        ensure!(buf.get(4) == Some(&byte), "{kind:?} byte");
+        ensure!(page_type(&buf)? == kind, "{kind:?} read back");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

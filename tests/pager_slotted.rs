@@ -1754,3 +1754,397 @@ proptest! {
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Page types with a slotted layout, `init_as`, `insert_with` and `cell_mut`
+// (Phase 2, step 2)
+// ---------------------------------------------------------------------------
+
+/// Page type bytes written here independently of the code (ADR 0005).
+const TYPE_FREE: u8 = 2;
+const TYPE_SLOTTED: u8 = 3;
+const TYPE_LEAF: u8 = 4;
+const TYPE_INTERNAL: u8 = 5;
+const TYPE_OVERFLOW: u8 = 6;
+
+/// A copy of `buf` with the page type byte set to `type_byte`.
+fn with_type_byte(buf: &[u8], type_byte: u8) -> anyhow::Result<Vec<u8>> {
+    let mut copy = buf.to_vec();
+    *copy.get_mut(4).context("page type byte")? = type_byte;
+    Ok(copy)
+}
+
+/// A copy of `buf` as a plain slotted page, so `check_invariants` (which
+/// expects type 3) can verify the pages of any slotted layout.
+fn invariants_hold(buf: &[u8]) -> anyhow::Result<()> {
+    check_invariants(&with_type_byte(buf, TYPE_SLOTTED)?)
+}
+
+/// A page of `page_type` with a marker in the node header area [24, 32).
+fn marked_page(size: usize, page_type: PageType) -> anyhow::Result<Vec<u8>> {
+    let mut buf = vec![0xAA; size];
+    SlottedPageMut::init_as(&mut buf, page_type)?;
+    put(&mut buf, 24, &[1, 2, 3, 4, 5, 6, 7, 8])?;
+    Ok(buf)
+}
+
+#[test]
+fn new_accepts_types_with_slotted_layout() -> anyhow::Result<()> {
+    let base = empty_page(512)?;
+    for type_byte in [TYPE_SLOTTED, TYPE_LEAF, TYPE_INTERNAL] {
+        let mut buf = with_type_byte(&base, type_byte)?;
+        SlottedPage::new(&buf).with_context(|| format!("read view, type {type_byte}"))?;
+        SlottedPageMut::new(&mut buf).with_context(|| format!("mut view, type {type_byte}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn new_rejects_types_without_slotted_layout() -> anyhow::Result<()> {
+    let base = empty_page(512)?;
+    for (type_byte, found) in [
+        (1u8, PageType::FileHeader),
+        (TYPE_FREE, PageType::Free),
+        (TYPE_OVERFLOW, PageType::Overflow),
+    ] {
+        let expected = PageError::UnexpectedPageType {
+            expected: PageType::Slotted,
+            found,
+        };
+        let buf = with_type_byte(&base, type_byte)?;
+        ensure!(
+            SlottedPage::new(&buf).err() == Some(expected),
+            "read view, type {type_byte}"
+        );
+        let mut copy = buf.clone();
+        ensure!(
+            SlottedPageMut::new(&mut copy).err() == Some(expected),
+            "mut view, type {type_byte}"
+        );
+        ensure!(copy == buf, "new modified a page of type {type_byte}");
+    }
+    Ok(())
+}
+
+#[test]
+fn init_as_sets_each_slotted_layout_type() -> anyhow::Result<()> {
+    for (page_type, type_byte) in [
+        (PageType::Slotted, TYPE_SLOTTED),
+        (PageType::BTreeLeaf, TYPE_LEAF),
+        (PageType::BTreeInternal, TYPE_INTERNAL),
+    ] {
+        for size in SIZES {
+            let mut buf = vec![0xAA; size];
+            SlottedPageMut::init_as(&mut buf, page_type)?;
+            ensure!(buf.get(4) == Some(&type_byte), "{page_type:?}: type byte");
+            ensure!(
+                slice(&buf, 0, 4)? == [0xAA; 4],
+                "{page_type:?}: checksum touched"
+            );
+            ensure!(
+                slice(&buf, 5, 11)? == [0; 11],
+                "{page_type:?}: [5, 16) not zero"
+            );
+            ensure!(
+                slice(&buf, 24, 8)? == [0; 8],
+                "{page_type:?}: node header area not zero"
+            );
+            ensure!(count_of(&buf)? == 0, "{page_type:?}: cell_count");
+            ensure!(free_end_of(&buf)? == size, "{page_type:?}: free_end");
+            SlottedPage::new(&buf)?.validate()?;
+            invariants_hold(&buf)?;
+            check_free_gap_zeroed(&buf)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn init_as_slotted_equals_init() -> anyhow::Result<()> {
+    let mut a = vec![0xAA; 512];
+    let mut b = vec![0xAA; 512];
+    SlottedPageMut::init(&mut a)?;
+    SlottedPageMut::init_as(&mut b, PageType::Slotted)?;
+    ensure!(a == b, "init and init_as(Slotted) differ");
+    Ok(())
+}
+
+#[test]
+fn init_as_rejects_types_without_slotted_layout() -> anyhow::Result<()> {
+    for found in [PageType::FileHeader, PageType::Free, PageType::Overflow] {
+        let mut buf = vec![0x5C; 512];
+        let before = buf.clone();
+        let expected = PageError::UnexpectedPageType {
+            expected: PageType::Slotted,
+            found,
+        };
+        ensure!(
+            SlottedPageMut::init_as(&mut buf, found) == Err(expected),
+            "{found:?}"
+        );
+        ensure!(buf == before, "{found:?}: init_as changed the buffer");
+    }
+    Ok(())
+}
+
+#[test]
+fn init_as_rejects_invalid_buffer_length_without_writing() -> anyhow::Result<()> {
+    let mut buf = vec![0x5C; 513];
+    let before = buf.clone();
+    ensure!(
+        SlottedPageMut::init_as(&mut buf, PageType::BTreeLeaf).is_err(),
+        "513 bytes"
+    );
+    ensure!(buf == before, "init_as changed an invalid buffer");
+    Ok(())
+}
+
+#[test]
+fn insert_with_hands_a_zeroed_destination_and_writes_in_place() -> anyhow::Result<()> {
+    let mut buf = empty_page(512)?;
+    let mut destination_ok = false;
+    SlottedPageMut::new(&mut buf)?.insert_with(0, 5, |dst| {
+        destination_ok = dst.len() == 5 && dst.iter().all(|&b| b == 0);
+        dst.copy_from_slice(b"hello");
+        Ok(())
+    })?;
+    ensure!(destination_ok, "the destination is 5 zeroed bytes");
+    // Same bytes as the literal layout of `insert_one_cell_literal_bytes`.
+    ensure!(slice(&buf, 507, 5)? == b"hello", "cell bytes");
+    ensure!(slice(&buf, 32, 4)? == [0xFB, 0x01, 5, 0], "slot 0");
+    ensure!(count_of(&buf)? == 1, "cell_count");
+    ensure!(free_end_of(&buf)? == 507, "free_end");
+    check_invariants(&buf)?;
+    check_free_gap_zeroed(&buf)
+}
+
+#[test]
+fn insert_with_gives_the_same_bytes_as_insert() -> anyhow::Result<()> {
+    let mut a = empty_page(512)?;
+    let mut b = empty_page(512)?;
+    let cells: [&[u8]; 4] = [b"mid", b"first", b"x", b"last-cell"];
+    let positions = [0usize, 0, 1, 3];
+    for (cell, index) in cells.iter().zip(positions) {
+        insert(&mut a, index, cell)?;
+        SlottedPageMut::new(&mut b)?.insert_with(index, cell.len(), |dst| {
+            dst.copy_from_slice(cell);
+            Ok(())
+        })?;
+    }
+    ensure!(a == b, "insert and insert_with differ");
+    Ok(())
+}
+
+#[test]
+fn insert_with_checks_before_calling_write() -> anyhow::Result<()> {
+    let mut buf = two_cell_page()?;
+    let before = buf.clone();
+    let mut calls = 0;
+    let mut run = |buf: &mut [u8], index: usize, len: usize| {
+        SlottedPageMut::new(buf).and_then(|mut page| {
+            page.insert_with(index, len, |_| {
+                calls += 1;
+                Ok(())
+            })
+        })
+    };
+    ensure!(run(&mut buf, 0, 0) == Err(PageError::EmptyCell), "empty");
+    ensure!(
+        matches!(
+            run(&mut buf, 0, 477),
+            Err(PageError::CellTooLarge { len: 477, .. })
+        ),
+        "too large"
+    );
+    ensure!(
+        matches!(
+            run(&mut buf, 3, 1),
+            Err(PageError::SlotOutOfRange {
+                index: 3,
+                cell_count: 2
+            })
+        ),
+        "index past count"
+    );
+    ensure!(
+        matches!(run(&mut buf, 0, 470), Err(PageError::PageFull { .. })),
+        "page full"
+    );
+    ensure!(calls == 0, "write ran {calls} times on a rejected insert");
+    ensure!(buf == before, "a rejected insert changed the buffer");
+    Ok(())
+}
+
+#[test]
+fn insert_with_failure_without_compaction_leaves_page_identical() -> anyhow::Result<()> {
+    let mut buf = two_cell_page()?;
+    let before = buf.clone();
+    let failure = PageError::CorruptSlottedPage { reason: "test" };
+    let result = SlottedPageMut::new(&mut buf)?.insert_with(1, 20, |dst| {
+        dst.fill(0xEE);
+        Err(failure)
+    });
+    ensure!(result == Err(failure), "the error of write is returned");
+    ensure!(buf == before, "the page changed after a failed write");
+    Ok(())
+}
+
+#[test]
+fn insert_with_failure_after_compaction_keeps_page_valid_and_zeroed() -> anyhow::Result<()> {
+    let mut buf = fragmented_page()?;
+    let cells_before = cells_of(&buf)?;
+    let failure = PageError::CorruptSlottedPage { reason: "test" };
+    // 100 + 4 > contiguous_free (65), but <= total_free (465): compacts first.
+    let result = SlottedPageMut::new(&mut buf)?.insert_with(1, 100, |dst| {
+        dst.fill(0xEE);
+        Err(failure)
+    });
+    ensure!(result == Err(failure), "the error of write is returned");
+    SlottedPage::new(&buf)?.validate()?;
+    check_invariants(&buf)?;
+    check_free_gap_zeroed(&buf)?;
+    ensure!(
+        cells_of(&buf)? == cells_before,
+        "compaction changed the cells"
+    );
+    ensure!(count_of(&buf)? == 2, "cell_count");
+    ensure!(fragmented_of(&buf)? == 0, "the page was compacted");
+    check_compacted(&buf)
+}
+
+#[test]
+fn insert_with_compacts_like_insert_and_succeeds() -> anyhow::Result<()> {
+    let mut a = fragmented_page()?;
+    let mut b = a.clone();
+    insert(&mut a, 1, &[0x77; 100])?;
+    SlottedPageMut::new(&mut b)?.insert_with(1, 100, |dst| {
+        dst.fill(0x77);
+        Ok(())
+    })?;
+    ensure!(a == b, "insert and insert_with differ after compaction");
+    check_no_holes(&b)
+}
+
+#[test]
+fn cell_mut_changes_the_cell_in_place() -> anyhow::Result<()> {
+    let mut buf = two_cell_page()?;
+    let before = buf.clone();
+    {
+        let mut page = SlottedPageMut::new(&mut buf)?;
+        let cell = page.cell_mut(1)?;
+        ensure!(cell == b"hello", "cell_mut returns the live cell");
+        cell.copy_from_slice(b"HELLO");
+    }
+    ensure!(slice(&buf, 507, 5)? == b"HELLO", "bytes changed in place");
+    // Only the five bytes of the cell changed.
+    for (at, (new, old)) in buf.iter().zip(&before).enumerate() {
+        ensure!(
+            (507..512).contains(&at) || new == old,
+            "byte {at} changed outside the cell"
+        );
+    }
+    ensure!(
+        cells_of(&buf)? == vec![b"ab".to_vec(), b"HELLO".to_vec()],
+        "cells"
+    );
+    check_invariants(&buf)
+}
+
+#[test]
+fn cell_mut_rejects_bad_indexes_and_corrupt_slots() -> anyhow::Result<()> {
+    let mut buf = two_cell_page()?;
+    let mut page = SlottedPageMut::new(&mut buf)?;
+    ensure!(
+        page.cell_mut(2).err()
+            == Some(PageError::SlotOutOfRange {
+                index: 2,
+                cell_count: 2
+            }),
+        "index == cell_count"
+    );
+    ensure!(
+        matches!(
+            page.cell_mut(usize::MAX),
+            Err(PageError::SlotOutOfRange { .. })
+        ),
+        "huge index"
+    );
+
+    let mut corrupt = two_cell_page()?;
+    put_slot(&mut corrupt, 0, 505, 0)?;
+    let before = corrupt.clone();
+    let mut page = SlottedPageMut::new(&mut corrupt)?;
+    expect_corrupt(page.cell_mut(0).map(|_| ()), "slot with len 0")?;
+    ensure!(corrupt == before, "a failed cell_mut changed the buffer");
+    Ok(())
+}
+
+#[test]
+fn slotted_operations_never_touch_the_node_header_area() -> anyhow::Result<()> {
+    for page_type in [PageType::BTreeLeaf, PageType::BTreeInternal] {
+        let mut buf = marked_page(512, page_type)?;
+        let marker = slice(&buf, 24, 8)?.to_vec();
+        let check = |buf: &[u8], step: &str| -> anyhow::Result<()> {
+            ensure!(
+                slice(buf, 24, 8)? == marker,
+                "{page_type:?}: {step} changed bytes 24..32"
+            );
+            Ok(())
+        };
+
+        insert(&mut buf, 0, b"bbbb")?;
+        check(&buf, "insert")?;
+        SlottedPageMut::new(&mut buf)?.insert_with(0, 4, |dst| {
+            dst.copy_from_slice(b"aaaa");
+            Ok(())
+        })?;
+        check(&buf, "insert_with")?;
+        SlottedPageMut::new(&mut buf)?.cell_mut(0)?.fill(b'z');
+        check(&buf, "cell_mut")?;
+        insert(&mut buf, 2, &[0x42; 300])?;
+        remove(&mut buf, 2)?;
+        check(&buf, "remove")?;
+        // 300 + 4 > contiguous free space, so this compacts.
+        insert(&mut buf, 2, &[0x43; 150])?;
+        check(&buf, "insert with compaction")?;
+        insert(&mut buf, 3, &[0x44; 100])?;
+        remove(&mut buf, 3)?;
+        compact(&mut buf)?;
+        check(&buf, "compact")?;
+        invariants_hold(&buf)?;
+        ensure!(
+            buf.get(4)
+                == Some(&if page_type == PageType::BTreeLeaf {
+                    TYPE_LEAF
+                } else {
+                    TYPE_INTERNAL
+                }),
+            "{page_type:?}: the page type changed"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn header_area_is_bytes_24_to_32() -> anyhow::Result<()> {
+    let mut buf = marked_page(512, PageType::BTreeLeaf)?;
+    ensure!(
+        SlottedPage::new(&buf)?.header_area()? == [1, 2, 3, 4, 5, 6, 7, 8],
+        "read view"
+    );
+    SlottedPageMut::new(&mut buf)?
+        .header_area_mut()?
+        .copy_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
+    ensure!(
+        slice(&buf, 24, 8)? == [9, 8, 7, 6, 5, 4, 3, 2],
+        "write view"
+    );
+    // The rest of the page is the fresh empty page.
+    let fresh = marked_page(512, PageType::BTreeLeaf)?;
+    ensure!(slice(&buf, 0, 24)? == slice(&fresh, 0, 24)?, "[0, 24)");
+    ensure!(
+        slice(&buf, 32, 480)? == slice(&fresh, 32, 480)?,
+        "[32, end)"
+    );
+    Ok(())
+}

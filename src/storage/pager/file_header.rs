@@ -1,4 +1,5 @@
-//! Database file header: magic number, format version, and page size.
+//! Database file header: magic number, format version, page size, and the
+//! catalog root.
 //!
 //! Stored in page 0, after the common page header (ADR 0003):
 //!
@@ -11,7 +12,8 @@
 //! | 32     | 4    | `page_count`: u32, >= 1, includes page 0                    |
 //! | 36     | 4    | `freelist_head`: u32, 0 = empty, otherwise < `page_count`    |
 //! | 40     | 4    | `freelist_count`: u32, 0 if and only if head is 0, < `page_count` |
-//! | 44     | rest | reserved                                                    |
+//! | 44     | 4    | `catalog_root`: u32, 0 = none, otherwise < `page_count`      |
+//! | 48     | rest | reserved                                                    |
 
 use crate::storage::pager::{
     codec::{read_u16, read_u32, slice, write_bytes, write_u16, write_u32},
@@ -23,9 +25,9 @@ use crate::storage::pager::{
 /// Identifies a database file of this engine: ASCII `STENGDB` and a zero byte.
 pub const MAGIC: [u8; 8] = *b"STENGDB\0";
 /// On-disk format version written by this build. Any layout change bumps it.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 /// First byte after the file header fields. `decode` needs at least this many bytes.
-pub const FILE_HEADER_END: usize = 44;
+pub const FILE_HEADER_END: usize = 48;
 
 const OFF_MAGIC: usize = 16;
 const OFF_VERSION: usize = 24;
@@ -33,6 +35,7 @@ const OFF_PAGE_SIZE: usize = 28;
 const OFF_PAGE_COUNT: usize = 32;
 const OFF_FREELIST_HEAD: usize = 36;
 const OFF_FREELIST_COUNT: usize = 40;
+const OFF_CATALOG_ROOT: usize = 44;
 
 /// Contents of the database file header (page 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +48,9 @@ pub struct FileHeader {
     pub freelist_head: Option<PageId>,
     /// Number of pages in the free list.
     pub freelist_count: u32,
+    /// Root page of the catalog tree, or `None` if the database has no catalog
+    /// yet (ADR 0005).
+    pub catalog_root: Option<PageId>,
 }
 
 impl FileHeader {
@@ -56,6 +62,7 @@ impl FileHeader {
             page_count: 1,
             freelist_head: None,
             freelist_count: 0,
+            catalog_root: None,
         }
     }
 
@@ -94,6 +101,7 @@ impl FileHeader {
             PageId::to_disk(self.freelist_head),
         )?;
         write_u32(buffer, OFF_FREELIST_COUNT, self.freelist_count)?;
+        write_u32(buffer, OFF_CATALOG_ROOT, PageId::to_disk(self.catalog_root))?;
 
         Ok(())
     }
@@ -115,7 +123,7 @@ impl FileHeader {
     /// 5. [`PageError::UnknownPageType`] or [`PageError::UnexpectedPageType`] if
     ///    page 0 is not a file header page.
     /// 6. [`PageError::CorruptHeader`] if the page count and free list fields
-    ///    contradict each other.
+    ///    contradict each other, or if `catalog_root` is past the end of the file.
     pub fn decode(buffer: &[u8]) -> Result<Self, PageError> {
         let buffer = slice(buffer, 0, FILE_HEADER_END)?;
 
@@ -177,11 +185,20 @@ impl FileHeader {
             }
         }
 
+        let file_header_catalog_root = read_u32(buffer, OFF_CATALOG_ROOT)?;
+        if file_header_catalog_root != 0 && file_header_catalog_root >= page_count {
+            return Err(PageError::CorruptHeader {
+                reason: "catalog_root is past the end of the file",
+            });
+        }
+        let catalog_root = PageId::from_disk(file_header_catalog_root);
+
         Ok(Self {
             page_size,
             page_count,
             freelist_head,
             freelist_count,
+            catalog_root,
         })
     }
 }

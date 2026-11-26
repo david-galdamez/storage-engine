@@ -31,8 +31,9 @@ const PAGE_LSN_OFFSET: usize = 8;
 
 /// Kind of page, stored at offset 4.
 ///
-/// On disk: 1 = file header, 2 = free, 3 = slotted. Byte 0 is not a variant: it
-/// marks an invalid page, so a zero-filled page is never taken for a real one.
+/// On disk: 1 = file header, 2 = free, 3 = slotted, 4 = B+Tree leaf, 5 = B+Tree
+/// internal, 6 = overflow (ADR 0005). Byte 0 is not a variant: it marks an
+/// invalid page, so a zero-filled page is never taken for a real one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
     /// Page 0: describes the database file.
@@ -41,6 +42,23 @@ pub enum PageType {
     Free,
     /// A page holding variable-size cells behind a slot directory.
     Slotted,
+    /// A B+Tree leaf: a slotted page whose cells are keys with values, and
+    /// whose bytes 24..32 hold the link to the next leaf.
+    BTreeLeaf,
+    /// A B+Tree internal node: a slotted page whose cells are separator keys
+    /// with child pointers, and whose bytes 24..32 hold the rightmost child.
+    BTreeInternal,
+    /// A page of the overflow chain of a value too large for a leaf.
+    Overflow,
+}
+
+impl PageType {
+    /// Returns whether pages of this type use the slotted layout of ADR 0003
+    /// (header, slot directory, cell area): slotted pages and B+Tree nodes.
+    #[must_use]
+    pub const fn has_slotted_layout(self) -> bool {
+        matches!(self, Self::Slotted | Self::BTreeLeaf | Self::BTreeInternal)
+    }
 }
 
 impl fmt::Display for PageType {
@@ -49,6 +67,9 @@ impl fmt::Display for PageType {
             Self::FileHeader => write!(f, "File Header"),
             Self::Free => write!(f, "Free"),
             Self::Slotted => write!(f, "Slotted"),
+            Self::BTreeLeaf => write!(f, "B+Tree Leaf"),
+            Self::BTreeInternal => write!(f, "B+Tree Internal"),
+            Self::Overflow => write!(f, "Overflow"),
         }
     }
 }
@@ -61,6 +82,9 @@ impl TryFrom<u8> for PageType {
             1 => Ok(Self::FileHeader),
             2 => Ok(Self::Free),
             3 => Ok(Self::Slotted),
+            4 => Ok(Self::BTreeLeaf),
+            5 => Ok(Self::BTreeInternal),
+            6 => Ok(Self::Overflow),
             _ => Err(PageError::UnknownPageType { value }),
         }
     }
@@ -72,6 +96,9 @@ impl From<PageType> for u8 {
             PageType::FileHeader => 1,
             PageType::Free => 2,
             PageType::Slotted => 3,
+            PageType::BTreeLeaf => 4,
+            PageType::BTreeInternal => 5,
+            PageType::Overflow => 6,
         }
     }
 }

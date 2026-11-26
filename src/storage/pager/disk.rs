@@ -139,6 +139,49 @@ impl Pager {
         self.file_header.page_count
     }
 
+    /// Returns the root page of the catalog tree (`catalog_root` in the file
+    /// header), or `None` if the database has no catalog yet.
+    #[must_use]
+    pub const fn catalog_root(&self) -> Option<PageId> {
+        self.file_header.catalog_root
+    }
+
+    /// Sets the root page of the catalog tree in the file header, or clears
+    /// it with `None`.
+    ///
+    /// Does not check the type of the page: the tree layer owns that. Does
+    /// not sync.
+    ///
+    /// # Errors
+    ///
+    /// - [`PagerError::ReservedPage`] if `root` is page 0 (the file header).
+    /// - [`PagerError::PageOutOfBounds`] if `root` is not below `page_count`.
+    ///   In both cases nothing is written.
+    /// - [`PagerError::Io`] if writing the file header fails. The in-memory
+    ///   header does not change.
+    pub fn set_catalog_root(&mut self, root: Option<PageId>) -> Result<(), PagerError> {
+        if let Some(page) = root {
+            if page.get() == 0 {
+                return Err(PagerError::ReservedPage { page });
+            }
+
+            if page.get() >= self.page_count() {
+                return Err(PagerError::PageOutOfBounds {
+                    page,
+                    page_count: self.page_count(),
+                });
+            }
+        }
+
+        let mut file_header = self.file_header;
+        file_header.catalog_root = root;
+
+        self.write_header(&file_header)?;
+        self.file_header = file_header;
+
+        Ok(())
+    }
+
     /// Reads page `page_id` into `buffer` and verifies its checksum. Page 0
     /// can be read.
     ///

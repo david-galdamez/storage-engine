@@ -13,6 +13,12 @@
 //!   Removed cells leave holes, counted in `fragmented_bytes`, until
 //!   [`SlottedPageMut::compact`] rewrites the cells without them.
 //!
+//! The layout is shared by every page type with a slotted layout
+//! ([`PageType::has_slotted_layout`]): plain slotted pages and the B+Tree nodes
+//! of ADR 0005. The views accept any of them. A caller that needs one type
+//! (a node view) checks it itself. Bytes 24..32 belong to the caller: no
+//! operation here writes them.
+//!
 //! The module exposes two borrowed views over the page buffer:
 //!
 //! - [`SlottedPage`] reads a page through a shared `&[u8]`.
@@ -22,9 +28,9 @@
 use std::cmp::Ordering;
 
 use crate::storage::pager::{
-    codec::{read_u16, read_u32, write_bytes, write_u16, write_u32},
+    codec::{read_u16, read_u32, slice, write_bytes, write_u16, write_u32},
     error::PageError,
-    page::{PageType, expect_page_type, set_page_type},
+    page::{PageType, page_type, set_page_type},
     types::PageSize,
 };
 
@@ -35,6 +41,14 @@ pub const SLOTTED_HEADER_SIZE: usize = 32;
 /// Size in bytes of one slot directory entry: a `u16` cell offset and a `u16`
 /// cell length.
 pub const SLOT_SIZE: usize = 4;
+
+/// Offset of the caller-owned area of the header (bytes 24..32). No operation
+/// of this module writes it; B+Tree nodes keep their sibling link or rightmost
+/// child there (ADR 0005).
+pub const HEADER_AREA_OFFSET: usize = 24;
+
+/// Size in bytes of the caller-owned area of the header.
+pub const HEADER_AREA_SIZE: usize = 8;
 
 /// Offset of the cell length within a slot entry.
 const SLOT_LEN_OFFSET: usize = 2;
@@ -64,7 +78,13 @@ fn page_size_for(buffer: &[u8]) -> Result<PageSize, PageError> {
 /// page. Does not write to `buffer`.
 fn check_header(buffer: &[u8]) -> Result<(), PageError> {
     let page_size = page_size_for(buffer)?;
-    expect_page_type(buffer, PageType::Slotted)?;
+    let found = page_type(buffer)?;
+    if !found.has_slotted_layout() {
+        return Err(PageError::UnexpectedPageType {
+            expected: PageType::Slotted,
+            found,
+        });
+    }
 
     let free_end = read_u32(buffer, FREE_END_OFFSET)?;
     if free_end > page_size.get() {
@@ -100,13 +120,15 @@ pub struct SlottedPage<'a> {
 }
 
 impl<'a> SlottedPage<'a> {
-    /// Creates a read view over `buffer`. Does not write to `buffer`.
+    /// Creates a read view over `buffer`. Does not write to `buffer`. Accepts
+    /// any page type with a slotted layout (see [`PageType::has_slotted_layout`]).
     ///
     /// # Errors
     ///
     /// Returns [`PageError::InvalidPageSize`] if `buffer` is not a valid page
-    /// size, [`PageError::UnknownPageType`] or [`PageError::UnexpectedPageType`]
-    /// if the page is not a slotted page, and [`PageError::CorruptSlottedPage`]
+    /// size, [`PageError::UnknownPageType`] if the type byte is unknown,
+    /// [`PageError::UnexpectedPageType`] (with `expected` set to
+    /// [`PageType::Slotted`]) if the page type has no slotted layout, and [`PageError::CorruptSlottedPage`]
     /// if the header fields are inconsistent.
     pub fn new(buffer: &'a [u8]) -> Result<Self, PageError> {
         check_header(buffer)?;
@@ -255,6 +277,17 @@ impl<'a> SlottedPage<'a> {
         Ok(Err(lo))
     }
 
+    /// Returns the caller-owned bytes 24..32 of the header, borrowed from the
+    /// page. Slotted operations never write them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageError::OutOfBounds`] if the buffer is too short, which
+    /// cannot happen for a view created with [`SlottedPage::new`].
+    pub fn header_area(&self) -> Result<&'a [u8], PageError> {
+        slice(self.page, HEADER_AREA_OFFSET, HEADER_AREA_SIZE)
+    }
+
     /// Returns the number of cells in the page.
     #[must_use]
     pub fn cell_count(&self) -> usize {
@@ -314,6 +347,27 @@ impl<'a> SlottedPageMut<'a> {
     /// a valid page size, in which case `buffer` is not modified. Returns
     /// [`PageError::OutOfBounds`] if the buffer is too short for the header.
     pub fn init(buffer: &mut [u8]) -> Result<(), PageError> {
+        Self::init_as(buffer, PageType::Slotted)
+    }
+
+    /// Formats `buffer` as an empty page of `page_type`, which must have a
+    /// slotted layout. Like [`Self::init`], but sets the given page type.
+    /// Bytes 24..32 are zeroed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageError::UnexpectedPageType`] (with `expected` set to
+    /// [`PageType::Slotted`]) if `page_type` has no slotted layout,
+    /// [`PageError::InvalidPageSize`] if the length of `buffer` is not a valid
+    /// page size, and [`PageError::OutOfBounds`] if the buffer is too short for
+    /// the header. `buffer` is not modified in any of these cases.
+    pub fn init_as(buffer: &mut [u8], page_type: PageType) -> Result<(), PageError> {
+        if !page_type.has_slotted_layout() {
+            return Err(PageError::UnexpectedPageType {
+                expected: PageType::Slotted,
+                found: page_type,
+            });
+        }
         let page_size = page_size_for(buffer)?;
 
         let rest = buffer.get_mut(5..).ok_or_else(|| PageError::OutOfBounds {
@@ -322,13 +376,14 @@ impl<'a> SlottedPageMut<'a> {
             buf_len: page_size.as_usize(),
         })?;
         rest.fill(0);
-        set_page_type(buffer, PageType::Slotted)?;
+        set_page_type(buffer, page_type)?;
         write_u32(buffer, FREE_END_OFFSET, page_size.get())?;
 
         Ok(())
     }
 
     /// Creates a mutable view over `buffer`. Does not write to `buffer`.
+    /// Accepts any page type with a slotted layout.
     ///
     /// # Errors
     ///
@@ -343,6 +398,25 @@ impl<'a> SlottedPageMut<'a> {
     #[must_use]
     pub const fn view(&self) -> SlottedPage<'_> {
         SlottedPage { page: self.page }
+    }
+
+    /// Returns the caller-owned bytes 24..32 of the header for writing. The
+    /// slotted operations never touch them, so they are the place for a
+    /// sibling link or a rightmost child pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PageError::OutOfBounds`] if the buffer is too short, which
+    /// cannot happen for a view created with [`SlottedPageMut::new`].
+    pub fn header_area_mut(&mut self) -> Result<&mut [u8], PageError> {
+        let buf_len = self.page.len();
+        self.page
+            .get_mut(HEADER_AREA_OFFSET..HEADER_AREA_OFFSET.saturating_add(HEADER_AREA_SIZE))
+            .ok_or(PageError::OutOfBounds {
+                offset: HEADER_AREA_OFFSET,
+                len: HEADER_AREA_SIZE,
+                buf_len,
+            })
     }
 
     /// Inserts `cell` at logical position `index`. The cell bytes go right
@@ -360,20 +434,47 @@ impl<'a> SlottedPageMut<'a> {
     /// Returns [`PageError::CorruptSlottedPage`] if the page needs compaction
     /// and fails validation.
     pub fn insert(&mut self, index: usize, cell: &[u8]) -> Result<(), PageError> {
+        self.insert_with(index, cell.len(), |dst| write_bytes(dst, 0, cell))
+    }
+
+    /// Inserts a cell of `len` bytes at logical position `index`, encoded in
+    /// place: `write` receives the `len`-byte destination of the new cell,
+    /// right below `free_end`, so the caller needs no scratch buffer.
+    ///
+    /// The checks, their order and the compaction rule are the same as in
+    /// [`Self::insert`]. The destination is all zeros when `write` starts.
+    /// Only after `write` returns `Ok` are the slots, the cell count and
+    /// `free_end` updated.
+    ///
+    /// If `write` fails, its error is returned, the header and the slots are
+    /// unchanged, and the destination is zeroed again, so the free space stays
+    /// all zeros (ADR 0003, invariant 8). The page may have been compacted
+    /// before `write` ran. That is fine: compaction keeps the cells and their
+    /// order, so the page has the same content as before the call. If no
+    /// compaction was needed, the buffer is byte-identical to the original.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::insert`], and any error returned by
+    /// `write`.
+    pub fn insert_with<F>(&mut self, index: usize, len: usize, write: F) -> Result<(), PageError>
+    where
+        F: FnOnce(&mut [u8]) -> Result<(), PageError>,
+    {
         let slotted_page = self.view();
         let cell_count = slotted_page.cell_count();
         let contiguous_free = slotted_page.contiguous_free();
         let total_free = slotted_page.total_free();
         let free_start = slotted_page.free_start();
 
-        if cell.is_empty() {
+        if len == 0 {
             return Err(PageError::EmptyCell);
         }
 
         let max_cell_len = max_cell_len(page_size_for(self.page)?);
-        if cell.len() > max_cell_len {
+        if len > max_cell_len {
             return Err(PageError::CellTooLarge {
-                len: cell.len(),
+                len,
                 max: max_cell_len,
             });
         }
@@ -382,7 +483,7 @@ impl<'a> SlottedPageMut<'a> {
             return Err(PageError::SlotOutOfRange { index, cell_count });
         }
 
-        let needed = cell.len().saturating_add(SLOT_SIZE);
+        let needed = len.saturating_add(SLOT_SIZE);
         if needed > total_free {
             return Err(PageError::PageFull {
                 needed,
@@ -398,19 +499,17 @@ impl<'a> SlottedPageMut<'a> {
         }
         let free_end = self.view().free_end();
 
+        let new_free_end_usize = free_end.saturating_sub(len);
         let new_free_end_u32 =
-            u32::try_from(free_end.saturating_sub(cell.len())).map_err(|_| {
-                PageError::CorruptSlottedPage {
-                    reason: "new free_end does not fit in u32",
-                }
+            u32::try_from(new_free_end_usize).map_err(|_| PageError::CorruptSlottedPage {
+                reason: "new free_end does not fit in u32",
             })?;
-        let new_free_end_usize = free_end.saturating_sub(cell.len());
         let slot_pos = (index.saturating_mul(SLOT_SIZE)).saturating_add(SLOTTED_HEADER_SIZE);
         let offset_u16 =
             u16::try_from(new_free_end_u32).map_err(|_| PageError::CorruptSlottedPage {
                 reason: "offset overflows",
             })?;
-        let len_u16 = u16::try_from(cell.len()).map_err(|_| PageError::CorruptSlottedPage {
+        let len_u16 = u16::try_from(len).map_err(|_| PageError::CorruptSlottedPage {
             reason: "len overflows",
         })?;
         let new_count = u16::try_from(cell_count.saturating_add(1)).map_err(|_| {
@@ -424,17 +523,35 @@ impl<'a> SlottedPageMut<'a> {
                 .ok_or(PageError::CorruptSlottedPage {
                     reason: "slot position overflows",
                 })?;
+        let slots_end = free_start.saturating_add(SLOT_SIZE);
 
-        let region = self
-            .page
-            .get_mut(slot_pos..free_start.saturating_add(SLOT_SIZE))
-            .ok_or(PageError::CorruptSlottedPage {
+        // Check the slot directory range before `write` runs, so nothing
+        // fallible is left between a successful `write` and the header update.
+        if self.page.get(slot_pos..slots_end).is_none() {
+            return Err(PageError::CorruptSlottedPage {
                 reason: "slot directory range out of the page",
-            })?;
-        region.copy_within(0..free_start.saturating_sub(slot_pos), SLOT_SIZE);
+            });
+        }
 
-        // Step 2: the cell bytes go right below the old free_end.
-        write_bytes(self.page, new_free_end_usize, cell)?;
+        // Step 1: the caller encodes the cell right below the old free_end.
+        let destination = self.page.get_mut(new_free_end_usize..free_end).ok_or(
+            PageError::CorruptSlottedPage {
+                reason: "cell range out of the page",
+            },
+        )?;
+        if let Err(error) = write(destination) {
+            destination.fill(0);
+            return Err(error);
+        }
+
+        // Step 2: shift the slots from `index` on, leaving a gap for the new one.
+        let region =
+            self.page
+                .get_mut(slot_pos..slots_end)
+                .ok_or(PageError::CorruptSlottedPage {
+                    reason: "slot directory range out of the page",
+                })?;
+        region.copy_within(0..free_start.saturating_sub(slot_pos), SLOT_SIZE);
 
         // Step 3: the new slot goes in the gap left by the shift.
         write_u16(self.page, slot_pos, offset_u16)?;
@@ -444,6 +561,28 @@ impl<'a> SlottedPageMut<'a> {
         write_u32(self.page, FREE_END_OFFSET, new_free_end_u32)?;
 
         Ok(())
+    }
+
+    /// Returns the bytes of the live cell at logical position `index` for
+    /// in-place changes, such as a fixed-size field. The length of the cell
+    /// cannot change.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`SlottedPage::cell`].
+    pub fn cell_mut(&mut self, index: usize) -> Result<&mut [u8], PageError> {
+        let cell_count = self.view().cell_count();
+        if index >= cell_count {
+            return Err(PageError::SlotOutOfRange { index, cell_count });
+        }
+
+        let (offset, end) = self.view().slot(index)?;
+
+        self.page
+            .get_mut(offset..end)
+            .ok_or(PageError::CorruptSlottedPage {
+                reason: "cell not in range of page",
+            })
     }
 
     /// Removes the cell at logical position `index`. Its bytes count as

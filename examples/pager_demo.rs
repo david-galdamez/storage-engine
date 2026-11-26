@@ -179,5 +179,8 @@ fn describe(kind: PageType, buffer: &[u8], number: u32) -> Result<String> {
         }
         PageType::FileHeader => "file header: see ADR 0003".to_string(),
         PageType::Free => format!("free page {number}, next_free is at offset 16"),
+        PageType::BTreeLeaf | PageType::BTreeInternal | PageType::Overflow => {
+            format!("{kind} page: see ADR 0005")
+        }
     })
 }

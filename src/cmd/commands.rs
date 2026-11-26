@@ -16,9 +16,18 @@ pub struct Cmd {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Get { key: String },
-    Set { key: String, value: String },
-    Delete { key: String },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
+    Delete {
+        key: String,
+    },
     Scan,
+    /// Check the B+Tree invariants and page accounting of the database file
+    Verify,
     Exit,
 }

@@ -319,14 +319,14 @@ fn open_rejects_unsupported_version() -> anyhow::Result<()> {
     let (_dir, path) = temp_db()?;
     drop(create(&path, 512)?);
     let mut bytes = [0u8; 2];
-    write_u16(&mut bytes, 0, 2)?;
+    write_u16(&mut bytes, 0, 1)?;
     patch(&path, OFF_VERSION, &bytes)?;
     let err = open_err(&path)?;
     ensure!(
         matches!(
             err,
             PagerError::Corrupted {
-                source: PageError::UnsupportedVersion { version: 2 },
+                source: PageError::UnsupportedVersion { version: 1 },
                 ..
             }
         ),
@@ -759,6 +759,122 @@ fn buffers_of_the_wrong_size_are_rejected() -> anyhow::Result<()> {
         );
     }
     ensure!(fs::read(&path)? == before, "the file changed");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Catalog root
+// ---------------------------------------------------------------------------
+
+#[test]
+fn new_file_has_no_catalog_root() -> anyhow::Result<()> {
+    let (_dir, path) = temp_db()?;
+    let pager = create(&path, 512)?;
+    ensure!(
+        pager.catalog_root().is_none(),
+        "new file has a catalog root"
+    );
+    drop(pager);
+    let pager = Pager::open(&path)?;
+    ensure!(pager.catalog_root().is_none(), "reopened file has a root");
+    Ok(())
+}
+
+#[test]
+fn catalog_root_persists_after_reopen() -> anyhow::Result<()> {
+    let (_dir, path) = temp_db()?;
+    let mut pager = create(&path, 512)?;
+    pager.allocate_page()?;
+    let root = pager.allocate_page()?;
+    pager.set_catalog_root(Some(root))?;
+    ensure!(pager.catalog_root() == Some(root), "in-memory root");
+    drop(pager);
+
+    let pager = Pager::open(&path)?;
+    ensure!(
+        pager.catalog_root() == Some(root),
+        "got {:?}",
+        pager.catalog_root()
+    );
+    Ok(())
+}
+
+#[test]
+fn catalog_root_is_written_to_the_header_on_disk() -> anyhow::Result<()> {
+    // No sync and no reopen: the header must already be written to the file.
+    let (_dir, path) = temp_db()?;
+    let mut pager = create_with_pages(&path, 512, 2)?;
+    pager.set_catalog_root(Some(PageId::new(2)))?;
+    let header_page = raw_page(&path, 512, 0)?;
+    ensure!(
+        raw_checksum_ok(&header_page)?,
+        "page 0 checksum not restamped"
+    );
+    let header = FileHeader::decode(&header_page)?;
+    ensure!(
+        header.catalog_root == Some(PageId::new(2)),
+        "got {:?}",
+        header.catalog_root
+    );
+    Ok(())
+}
+
+#[test]
+fn catalog_root_can_be_cleared() -> anyhow::Result<()> {
+    let (_dir, path) = temp_db()?;
+    let mut pager = create_with_pages(&path, 512, 1)?;
+    pager.set_catalog_root(Some(PageId::new(1)))?;
+    pager.set_catalog_root(None)?;
+    ensure!(pager.catalog_root().is_none(), "in-memory root");
+    drop(pager);
+
+    let pager = Pager::open(&path)?;
+    ensure!(
+        pager.catalog_root().is_none(),
+        "root came back after reopen"
+    );
+    Ok(())
+}
+
+#[test]
+fn set_catalog_root_rejects_page_0() -> anyhow::Result<()> {
+    let (_dir, path) = temp_db()?;
+    let mut pager = create(&path, 512)?;
+    let result = pager.set_catalog_root(Some(PageId::new(0)));
+    ensure!(
+        matches!(result, Err(PagerError::ReservedPage { page }) if page == PageId::new(0)),
+        "got {result:?}"
+    );
+    ensure!(pager.catalog_root().is_none(), "root changed");
+    Ok(())
+}
+
+#[test]
+fn set_catalog_root_rejects_pages_out_of_range() -> anyhow::Result<()> {
+    let (_dir, path) = temp_db()?;
+    let mut pager = create_with_pages(&path, 512, 2)?;
+    let kept = PageId::new(1);
+    pager.set_catalog_root(Some(kept))?;
+
+    for id in [3, 4, u32::MAX] {
+        let result = pager.set_catalog_root(Some(PageId::new(id)));
+        ensure!(
+            matches!(
+                result,
+                Err(PagerError::PageOutOfBounds { page, page_count: 3 }) if page == PageId::new(id)
+            ),
+            "page {id}: got {result:?}"
+        );
+    }
+    ensure!(pager.catalog_root() == Some(kept), "in-memory root changed");
+    drop(pager);
+
+    let pager = Pager::open(&path)?;
+    ensure!(
+        pager.catalog_root() == Some(kept),
+        "root on disk changed: {:?}",
+        pager.catalog_root()
+    );
     Ok(())
 }
 

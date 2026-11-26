@@ -5,7 +5,7 @@
 //!
 //! - `encode` writes every field at its offset, zeroes the rest of the page
 //!   from offset 4, and never touches the checksum.
-//! - `decode` round-trips every valid header and works on a 44-byte prefix,
+//! - `decode` round-trips every valid header and works on a 48-byte prefix,
 //!   because `Pager::open` reads only a 512-byte prefix before it knows the
 //!   page size. It ignores the checksum, the LSN and the reserved bytes.
 //! - `decode` returns the first failing check, in this order: length, magic,
@@ -35,6 +35,7 @@ const OFF_PAGE_SIZE: usize = 28;
 const OFF_PAGE_COUNT: usize = 32;
 const OFF_FREELIST_HEAD: usize = 36;
 const OFF_FREELIST_COUNT: usize = 40;
+const OFF_CATALOG_ROOT: usize = 44;
 
 /// Page sizes allowed by ADR 0001 that the tests cover: smallest, default, largest.
 const SIZES: [u32; 3] = [512, 4096, 65536];
@@ -46,6 +47,7 @@ fn sample() -> anyhow::Result<FileHeader> {
         page_count: 7,
         freelist_head: Some(PageId::new(5)),
         freelist_count: 2,
+        catalog_root: None,
     })
 }
 
@@ -88,8 +90,8 @@ fn page_with_counts(page_count: u32, head: u32, count: u32) -> anyhow::Result<Ve
 #[test]
 fn constants_match_adr() {
     assert_eq!(&MAGIC, b"STENGDB\0");
-    assert_eq!(FORMAT_VERSION, 1);
-    assert_eq!(FILE_HEADER_END, 44);
+    assert_eq!(FORMAT_VERSION, 2);
+    assert_eq!(FILE_HEADER_END, 48);
 }
 
 #[test]
@@ -100,6 +102,7 @@ fn new_header_describes_an_empty_database() -> anyhow::Result<()> {
     ensure!(header.page_count == 1, "only page 0 exists in a new file");
     ensure!(header.freelist_head.is_none(), "free list must be empty");
     ensure!(header.freelist_count == 0, "free list count must be 0");
+    ensure!(header.catalog_root.is_none(), "a new file has no catalog");
     Ok(())
 }
 
@@ -123,12 +126,13 @@ fn encode_writes_every_field_at_its_offset() -> anyhow::Result<()> {
     expect(5, &[0, 0, 0])?; // reserved
     expect(8, &[0; 8])?; // LSN
     expect(OFF_MAGIC, b"STENGDB\0")?;
-    expect(OFF_VERSION, &[0x01, 0x00])?;
+    expect(OFF_VERSION, &[0x02, 0x00])?;
     expect(OFF_RESERVED, &[0x00, 0x00])?;
     expect(OFF_PAGE_SIZE, &[0x00, 0x10, 0x00, 0x00])?; // 4096
     expect(OFF_PAGE_COUNT, &[0x07, 0x00, 0x00, 0x00])?;
     expect(OFF_FREELIST_HEAD, &[0x05, 0x00, 0x00, 0x00])?;
     expect(OFF_FREELIST_COUNT, &[0x02, 0x00, 0x00, 0x00])?;
+    expect(OFF_CATALOG_ROOT, &[0x00, 0x00, 0x00, 0x00])?; // none
     Ok(())
 }
 
@@ -137,8 +141,8 @@ fn encode_writes_empty_free_list_as_zero() -> anyhow::Result<()> {
     let buf = encoded(&FileHeader::new(PageSize::new(512)?))?;
     let fields = buf.get(OFF_PAGE_COUNT..FILE_HEADER_END).context("fields")?;
     ensure!(
-        fields == [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        "page_count 1, head 0, count 0 expected, got {fields:02x?}"
+        fields == [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "page_count 1, head 0, count 0, catalog 0 expected, got {fields:02x?}"
     );
     Ok(())
 }
@@ -193,7 +197,7 @@ fn encode_accepts_exactly_header_sized_buffer() -> anyhow::Result<()> {
     header.encode(&mut buf)?;
     ensure!(
         FileHeader::decode(&buf)? == header,
-        "44-byte round trip failed"
+        "48-byte round trip failed"
     );
     Ok(())
 }
@@ -300,7 +304,7 @@ fn bad_magic_reports_bytes_found() -> anyhow::Result<()> {
 
 #[test]
 fn unsupported_version_is_rejected() -> anyhow::Result<()> {
-    for version in [0, 2, u16::MAX] {
+    for version in [0, 1, 3, u16::MAX] {
         let mut buf = sample_page()?;
         write_u16(&mut buf, OFF_VERSION, version)?;
         let result = FileHeader::decode(&buf);
@@ -412,6 +416,90 @@ fn boundary_values_are_valid() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// decode: catalog root
+// ---------------------------------------------------------------------------
+
+#[test]
+fn catalog_root_round_trips() -> anyhow::Result<()> {
+    let header = FileHeader {
+        catalog_root: Some(PageId::new(6)),
+        ..sample()?
+    };
+    let decoded = FileHeader::decode(&encoded(&header)?)?;
+    ensure!(decoded == header, "got {decoded:?}");
+    Ok(())
+}
+
+#[test]
+fn catalog_root_is_stored_at_offset_44_little_endian() -> anyhow::Result<()> {
+    let header = FileHeader {
+        page_count: 0x0102_0305,
+        freelist_head: None,
+        freelist_count: 0,
+        catalog_root: Some(PageId::new(0x0102_0304)),
+        ..sample()?
+    };
+    let buf = encoded(&header)?;
+    let field = buf
+        .get(OFF_CATALOG_ROOT..FILE_HEADER_END)
+        .context("field")?;
+    ensure!(field == [0x04, 0x03, 0x02, 0x01], "got {field:02x?}");
+    Ok(())
+}
+
+#[test]
+fn reserved_bytes_start_at_48() -> anyhow::Result<()> {
+    ensure!(
+        FILE_HEADER_END == 48,
+        "FILE_HEADER_END is {FILE_HEADER_END}"
+    );
+    let header = FileHeader {
+        catalog_root: Some(PageId::new(6)),
+        ..sample()?
+    };
+    let buf = encoded(&header)?;
+    let reserved = buf.get(48..).context("reserved")?;
+    ensure!(
+        reserved.iter().all(|b| *b == 0),
+        "bytes from 48 must be zero"
+    );
+    Ok(())
+}
+
+#[test]
+fn catalog_root_zero_decodes_as_none() -> anyhow::Result<()> {
+    let mut buf = encoded(&FileHeader {
+        catalog_root: Some(PageId::new(6)),
+        ..sample()?
+    })?;
+    write_u32(&mut buf, OFF_CATALOG_ROOT, 0)?;
+    let decoded = FileHeader::decode(&buf)?;
+    ensure!(decoded.catalog_root.is_none(), "got {decoded:?}");
+    Ok(())
+}
+
+#[test]
+fn catalog_root_past_the_end_is_corrupt() -> anyhow::Result<()> {
+    // sample() has 7 pages, so the valid roots are 1..=6.
+    for root in [7, 8, u32::MAX] {
+        let mut buf = sample_page()?;
+        write_u32(&mut buf, OFF_CATALOG_ROOT, root)?;
+        let result = FileHeader::decode(&buf);
+        ensure!(
+            result
+                == Err(PageError::CorruptHeader {
+                    reason: "catalog_root is past the end of the file"
+                }),
+            "root {root}: got {result:?}"
+        );
+    }
+    let mut buf = sample_page()?;
+    write_u32(&mut buf, OFF_CATALOG_ROOT, 6)?;
+    ensure!(FileHeader::decode(&buf).is_ok(), "root 6 must be valid");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // decode: check order
 // ---------------------------------------------------------------------------
 
@@ -419,7 +507,7 @@ fn boundary_values_are_valid() -> anyhow::Result<()> {
 fn magic_is_checked_before_version() -> anyhow::Result<()> {
     let mut buf = sample_page()?;
     write_bytes(&mut buf, OFF_MAGIC, &[0; 8])?;
-    write_u16(&mut buf, OFF_VERSION, 2)?;
+    write_u16(&mut buf, OFF_VERSION, 3)?;
     let result = FileHeader::decode(&buf);
     ensure!(
         matches!(result, Err(PageError::BadMagic { .. })),
@@ -431,11 +519,11 @@ fn magic_is_checked_before_version() -> anyhow::Result<()> {
 #[test]
 fn version_is_checked_before_page_size() -> anyhow::Result<()> {
     let mut buf = sample_page()?;
-    write_u16(&mut buf, OFF_VERSION, 2)?;
+    write_u16(&mut buf, OFF_VERSION, 3)?;
     write_u32(&mut buf, OFF_PAGE_SIZE, 1000)?;
     let result = FileHeader::decode(&buf);
     ensure!(
-        result == Err(PageError::UnsupportedVersion { version: 2 }),
+        result == Err(PageError::UnsupportedVersion { version: 3 }),
         "got {result:?}"
     );
     Ok(())
@@ -479,10 +567,11 @@ fn any_valid_header() -> impl Strategy<Value = FileHeader> {
         any::<bool>(),
         any::<u32>(),
         any::<u32>(),
+        prop::option::of(any::<u32>()),
     )
         .prop_filter_map(
             "invalid page size",
-            |(size, page_count, has_free, head_seed, count_seed)| {
+            |(size, page_count, has_free, head_seed, count_seed, root_seed)| {
                 let page_size = PageSize::new(size).ok()?;
                 // Pages 1..page_count can be free: there are page_count - 1 of them.
                 let free_pages = page_count.saturating_sub(1);
@@ -493,11 +582,19 @@ fn any_valid_header() -> impl Strategy<Value = FileHeader> {
                 } else {
                     (None, 0)
                 };
+                // The catalog root is either none or any page 1..page_count.
+                let catalog_root = match root_seed {
+                    Some(seed) if free_pages > 0 => {
+                        Some(PageId::new(seed.checked_rem(free_pages)?.saturating_add(1)))
+                    }
+                    _ => None,
+                };
                 Some(FileHeader {
                     page_size,
                     page_count,
                     freelist_head,
                     freelist_count,
+                    catalog_root,
                 })
             },
         )

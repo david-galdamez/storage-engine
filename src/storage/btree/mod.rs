@@ -1,0 +1,41 @@
+//! B+Tree: node views over pager pages.
+//!
+//! The node format is described in ADR 0005
+//! (`docs/decisions/0005-btree-node-format.md`). This module has the node
+//! level (borrowed read and write views of one leaf or internal node, and the
+//! cell encodings) and the tree handle with lookup, insert with leaf and
+//! internal splits, and delete with rebalancing of leaves and internal nodes.
+//! Overflow chains for large values live in [`overflow`](self::overflow), and
+//! ordered range scans in [`cursor`](self::cursor). Rebalancing lives in
+//! `rebalance`.
+//!
+//! - [`node`](self::node): size limits, [`node::ValueRef`] and the leaf cell codec.
+//! - [`leaf`](self::leaf): [`leaf::LeafNode`] and [`leaf::LeafNodeMut`].
+//! - [`internal`](self::internal): [`internal::InternalNode`] and [`internal::InternalNodeMut`].
+//! - [`overflow`](self::overflow): overflow page views and chain read, write and free.
+//! - [`cursor`](self::cursor): [`cursor::Cursor`] and a re-export of
+//!   [`Direction`](crate::storage::engine::Direction), range scans.
+//! - `rebalance`: merge, redistribution, parent split and root collapse of leaves
+//!   and internal nodes after a delete.
+//! - [`tree`](self::tree): [`tree::BTree`], the handle of one tree.
+//! - [`engine`](self::engine): [`engine::BTreeEngine`], the `StorageEngine` implementation.
+//! - [`error`](self::error): [`error::NodeError`] and [`error::BTreeError`].
+//! - [`verify`](self::verify): [`verify::verify_tree`] and [`verify::verify_file`],
+//!   whole-tree and whole-file structural checks.
+
+pub mod cursor;
+pub mod engine;
+pub mod error;
+pub mod internal;
+pub mod leaf;
+pub mod node;
+pub mod overflow;
+mod rebalance;
+pub mod tree;
+pub mod verify;
+
+pub use cursor::{Cursor, Direction};
+pub use engine::{BTreeEngine, BTreeScan};
+pub use error::Violation;
+pub use tree::BTree;
+pub use verify::{TreeStats, verify_file, verify_tree};

@@ -52,15 +52,21 @@ xxd -s 0x200 -l 512 target/pager-demo.db          # one page
 
 The checksum is a CRC32 (IEEE) of bytes `[4, page_size)`: everything in the page
 **except** the checksum field itself. The pager stamps it on every write and
-checks it on every read. For page 0 below, the bytes `04 32 9b 25` are the
-little-endian u32 `0x259b3204`, and the CRC32 of the other 508 bytes of page 0
-is exactly that value.
+checks it on every read. For page 0 below, the bytes `7b ac 64 19` are the
+little-endian u32 `0x1964ac7b`, and the CRC32 of the other 508 bytes of page 0
+is exactly that value. (The checksum of page 0 changed when the header moved to
+format version 2.)
 
 ## Page 0: the file header (offset `0x000`)
 
+The file header layout is format version 2. It adds `catalog_root` at offset 44
+and moves the reserved bytes to offset 48. See
+[ADR 0005](../decisions/0005-btree-node-format.md) (section "File header, format
+version 2").
+
 ```
-00000000: 0432 9b25 0100 0000 0000 0000 0000 0000  .2.%............
-00000010: 5354 454e 4744 4200 0100 0000 0002 0000  STENGDB.........
+00000000: 7bac 6419 0100 0000 0000 0000 0000 0000  {.d.............
+00000010: 5354 454e 4744 4200 0200 0000 0002 0000  STENGDB.........
 00000020: 0500 0000 0400 0000 0200 0000 0000 0000  ................
 00000030: 0000 0000 0000 0000 0000 0000 0000 0000  ................
 *
@@ -68,18 +74,19 @@ is exactly that value.
 
 | Bytes (hex)               | Offset | Field |
 |---------------------------|--------|-------|
-| `04 32 9b 25`             | 0      | checksum = `0x259b3204` |
+| `7b ac 64 19`             | 0      | checksum = `0x1964ac7b` |
 | `01`                      | 4      | page type 1 = file header |
 | `00 00 00`                | 5      | reserved |
 | `00 00 00 00 00 00 00 00` | 8      | page LSN = 0 |
 | `53 54 45 4e 47 44 42 00` | 16     | magic `STENGDB\0` |
-| `01 00`                   | 24     | format version = 1 |
+| `02 00`                   | 24     | format version = 2 |
 | `00 00`                   | 26     | reserved |
 | `00 02 00 00`             | 28     | page size = `0x200` = 512 |
 | `05 00 00 00`             | 32     | page count = 5 (including page 0) |
 | `04 00 00 00`             | 36     | free list head = page 4 |
 | `02 00 00 00`             | 40     | free list count = 2 |
-| zeros                     | 44-511 | reserved |
+| `00 00 00 00`             | 44     | catalog root = 0 (none yet) |
+| zeros                     | 48-511 | reserved |
 
 ## Page 1: slotted page with a hole (offset `0x200`)
 

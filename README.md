@@ -8,9 +8,10 @@ full document database: MongoDB-style JSON-like documents, collections with
 validation, secondary indexes, ACID transactions, a binary TCP protocol, and
 eventually vector tables for similarity search.
 
-> **Status:** Phase 0 (in-memory store and REPL) and Phase 1 (pager) are done.
-> Phase 2 (B+Tree) is next. Nothing here is production-ready. The project has
-> no final name yet.
+> **Status:** Phases 0 to 2 are done: an on-disk pager and a persistent B+Tree
+> behind a `StorageEngine` trait, tested through a REPL. Phase 3 (WAL and crash
+> recovery) is next. Until then, a crash during a write can corrupt the file.
+> Nothing here is production-ready. The project has no final name yet.
 
 ---
 
@@ -83,6 +84,9 @@ Aggregations (`$match`, `$group`, `$sort`, `$project`, ...) are in scope.
                                                      └──────────────────────────┘
 ```
 
+Today only the pager and the B+Tree exist. Pages are read and written straight
+to the file (no buffer pool or WAL yet).
+
 The storage engine sits behind a `StorageEngine` trait, so other
 implementations (for example an LSM-Tree) can be tried later.
 
@@ -90,10 +94,10 @@ implementations (for example an LSM-Tree) can be tried later.
 
 | Phase | Milestone                                                                 | Status      |
 |-------|---------------------------------------------------------------------------|-------------|
-| 0     | In-memory key-value store + REPL to test it                               | Done        |
+| 0     | In-memory key-value store + REPL to test it (store removed in Phase 2)    | Done        |
 | 1     | Pager: on-disk file, fixed-size pages, slotted page layout                | Done        |
-| 2     | B+Tree key-value storage engine behind a `StorageEngine` trait            | Next        |
-| 3     | Write-ahead log (WAL) and crash recovery                                  | Planned     |
+| 2     | B+Tree key-value storage engine behind a `StorageEngine` trait            | Done        |
+| 3     | Write-ahead log (WAL) and crash recovery                                  | Next        |
 | 4     | Buffer pool / page cache                                                  | Planned     |
 | 5     | Binary document format with in-place field access, UUID `_id`             | Planned     |
 | 6     | Databases, models (collections), catalog and per-model validation         | Planned     |
@@ -110,18 +114,23 @@ Requirements: a recent stable Rust toolchain (edition 2024).
 
 ```bash
 cargo build
-cargo run          # starts the test REPL
+cargo run -- [path]   # starts the test REPL (default file: repl.db)
 ```
 
-REPL commands (Phase 0, in-memory only):
+REPL commands. Data is stored in a B+Tree file (`repl.db` by default, or the
+path given as argument) and persists between runs:
 
 ```
 $ set <key> <value>
 $ get <key>
 $ delete <key>
 $ scan
+$ verify
 $ exit
 ```
+
+`verify` checks the tree invariants that can be read from the file and that
+each page of the file is in the tree or on the free list. It prints `OK height=.. entries=.. node_pages=.. overflow_pages=..`.
 
 The REPL exists only to check that data is stored correctly. It will be
 replaced by two binaries: a **server** and a **client**.
