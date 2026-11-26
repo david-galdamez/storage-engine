@@ -35,8 +35,6 @@ mod db;
 mod leaks;
 #[path = "support/lookup.rs"]
 mod lookup;
-#[path = "support/non_empty.rs"]
-mod non_empty;
 #[path = "support/shape.rs"]
 mod shape;
 
@@ -49,13 +47,12 @@ use build::{bulk_load, write_internal, write_leaf};
 use db::{new_pager, temp_db};
 use leaks::ensure_no_leaks;
 use lookup::{ensure_missing, ensure_value, get};
-use non_empty::check_non_empty;
 use proptest::prelude::*;
 use shape::{blank, height, numbered_entries};
 use storage_engine_rs::storage::btree::internal::InternalNode;
 use storage_engine_rs::storage::btree::leaf::LeafNode;
 use storage_engine_rs::storage::btree::overflow::read_value;
-use storage_engine_rs::storage::btree::{BTree, Direction};
+use storage_engine_rs::storage::btree::{BTree, Direction, verify_tree};
 use storage_engine_rs::storage::pager::disk::Pager;
 use storage_engine_rs::storage::pager::types::PageId;
 
@@ -412,7 +409,7 @@ fn a_merge_that_empties_a_non_root_parent_merges_it_and_collapses_the_root() -> 
         check_tree(&pager, deep.tree)?
             == small_entries(&[b"a", b"d", b"e", b"m", b"n", b"s", b"t"])
     );
-    check_non_empty(&pager, deep.tree)?;
+    verify_tree(&pager, deep.tree)?;
     ensure_no_leaks(&pager, deep.tree)?;
 
     // The tree opens again from the file, and reads and writes work.
@@ -459,7 +456,7 @@ fn a_merge_rebalances_an_underfull_parent_up_to_the_root() -> anyhow::Result<()>
     ensure!(leaf_chain(&pager, deep.tree)? == [l1, l3, l4, l5]);
     ensure!(pager.free_page_count() == 3, "l2 {l2}, p1 and p2 are free");
     ensure!(height(&pager, deep.root)? == 2);
-    check_non_empty(&pager, deep.tree)?;
+    verify_tree(&pager, deep.tree)?;
     ensure_no_leaks(&pager, deep.tree)?;
     Ok(())
 }
@@ -544,7 +541,7 @@ fn an_internal_merge_pulls_the_separator_down() -> anyhow::Result<()> {
     ensure!(leaf_chain(&pager, tree)? == [at(0)?, at(2)?, at(3)?, at(4)?, at(5)?, at(6)?, at(7)?]);
     let expected: Entries = (1..8).map(|i| (short_key(i), V.to_vec())).collect();
     ensure!(check_tree(&pager, tree)? == expected);
-    check_non_empty(&pager, tree)?;
+    verify_tree(&pager, tree)?;
     ensure_no_leaks(&pager, tree)?;
     Ok(())
 }
@@ -590,7 +587,7 @@ fn an_internal_rotation_moves_cells_and_children_between_nodes() -> anyhow::Resu
     ensure!(pager.free_page_count() == 1, "only the merged leaf is free");
     let expected: Entries = (1..16).map(|i| (wide_key(i), V.to_vec())).collect();
     ensure!(check_tree(&pager, tree)? == expected);
-    check_non_empty(&pager, tree)?;
+    verify_tree(&pager, tree)?;
     ensure_no_leaks(&pager, tree)?;
     Ok(())
 }
@@ -652,7 +649,7 @@ fn a_long_separator_splits_a_parent_full_of_short_ones() -> anyhow::Result<()> {
     for (key, value) in &expected {
         ensure_value(get(tree, &pager, key)?.as_deref(), value, "key")?;
     }
-    check_non_empty(&pager, tree)?;
+    verify_tree(&pager, tree)?;
     ensure_no_leaks(&pager, tree)?;
     Ok(())
 }
@@ -717,7 +714,7 @@ fn a_separator_that_does_not_fit_in_the_parent_splits_it() -> anyhow::Result<()>
     for (key, value) in &expected {
         ensure_value(get(tree, &pager, key)?.as_deref(), value, "key")?;
     }
-    check_non_empty(&pager, tree)?;
+    verify_tree(&pager, tree)?;
     ensure_no_leaks(&pager, tree)?;
     Ok(())
 }
@@ -779,7 +776,7 @@ fn a_redistribution_can_move_an_overflow_cell_between_leaves() -> anyhow::Result
     ensure!(after == overflow_pages, "the chain changed");
     let expected: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     ensure!(entries == expected, "entries");
-    check_non_empty(&pager, tree)?;
+    verify_tree(&pager, tree)?;
     Ok(())
 }
 
@@ -826,7 +823,7 @@ fn delete_all_checking(
         if step.is_multiple_of(every) || model.len() < 40 {
             let (_, found) = ensure_no_leaks(pager, tree)?;
             ensure!(found.len() == model.len(), "{order:?}: entry count");
-            check_non_empty(pager, tree)?;
+            verify_tree(pager, tree)?;
         }
     }
     Ok(())
@@ -984,7 +981,7 @@ fn run_model(ops: &[Op]) -> anyhow::Result<usize> {
         }
         let expected: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         ensure!(check_tree(&pager, tree)? == expected, "entries differ");
-        check_non_empty(&pager, tree)?;
+        verify_tree(&pager, tree)?;
         max_height = max_height.max(height(&pager, root)?);
     }
 
@@ -1004,7 +1001,7 @@ fn run_model(ops: &[Op]) -> anyhow::Result<usize> {
     for (step, key) in model.keys().enumerate() {
         ensure!(tree.delete(&mut pager, key)?, "{key:?} was missing");
         if step.is_multiple_of(4) {
-            check_non_empty(&pager, tree)?;
+            verify_tree(&pager, tree)?;
         }
     }
     ensure_collapsed(&pager, tree, root, "proptest")?;

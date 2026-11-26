@@ -35,8 +35,6 @@ mod db;
 mod leaks;
 #[path = "support/lookup.rs"]
 mod lookup;
-#[path = "support/non_empty.rs"]
-mod non_empty;
 #[path = "support/shape.rs"]
 mod shape;
 
@@ -48,15 +46,14 @@ use btree_check::{Entries, check_tree, leaf_chain};
 use db::{new_pager, temp_db};
 use leaks::ensure_no_leaks;
 use lookup::{ensure_missing, ensure_value, get};
-use non_empty::check_non_empty;
 use proptest::prelude::*;
 use shape::{blank, height, numbered_entries};
-use storage_engine_rs::storage::btree::error::BTreeError;
+use storage_engine_rs::storage::btree::error::{BTreeError, Violation};
 use storage_engine_rs::storage::btree::internal::InternalNode;
 use storage_engine_rs::storage::btree::leaf::{LeafNode, LeafNodeMut};
 use storage_engine_rs::storage::btree::node::max_key_len;
 use storage_engine_rs::storage::btree::overflow::{overflow_capacity, read_value};
-use storage_engine_rs::storage::btree::{BTree, Direction};
+use storage_engine_rs::storage::btree::{BTree, Direction, verify_tree};
 use storage_engine_rs::storage::pager::disk::Pager;
 use storage_engine_rs::storage::pager::types::PageId;
 
@@ -375,7 +372,7 @@ fn delete_every_key_of_a_three_level_tree() -> anyhow::Result<()> {
     ensure!(height(&pager, root)? == 1, "the tree did not collapse");
     ensure!(leaf_chain(&pager, tree)? == [root], "leaf chain");
     ensure!(check_tree(&pager, tree)?.is_empty(), "entries left");
-    check_non_empty(&pager, tree)?;
+    verify_tree(&pager, tree)?;
     let others = pager.page_count().checked_sub(2).context("pages")?;
     ensure!(others == pager.free_page_count(), "pages are not free");
     ensure_no_leaks(&pager, tree)?;
@@ -416,7 +413,6 @@ fn empty_leaf_at(position: Position) -> anyhow::Result<()> {
     );
     let remaining: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     ensure!(check_tree(&pager, tree)? == remaining, "check_tree");
-    check_non_empty(&pager, tree)?;
 
     let first = doomed.first().context("first")?;
     let last = doomed.last().context("last")?;
@@ -492,8 +488,14 @@ fn hand_emptied_leaf_at(position: Position) -> anyhow::Result<()> {
     }
     ensure!(leaf_chain(&pager, tree)? == leaves, "leaf chain");
     ensure!(leaf_keys(&pager, target)?.is_empty(), "leaf is not empty");
-    let remaining: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    ensure!(check_tree(&pager, tree)? == remaining, "check_tree");
+    // The tree is invalid on purpose, so the scans below are the check.
+    ensure!(
+        matches!(
+            verify_tree(&pager, tree),
+            Err(BTreeError::Invariant { page, violation: Violation::EmptyLeaf }) if page == target
+        ),
+        "verify_tree did not report the empty leaf"
+    );
 
     let first = doomed.first().context("first")?;
     let last = doomed.last().context("last")?;
@@ -657,7 +659,7 @@ fn run_model(keys: &[Vec<u8>], ops: &[Op], bounds: &[(Spec, Spec)]) -> anyhow::R
     }
 
     let all: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    check_non_empty(&pager, tree)?;
+    verify_tree(&pager, tree)?;
     let (_, entries) = ensure_no_leaks(&pager, tree)?;
     ensure!(entries == all, "entries differ from the model");
     check_range(tree, &pager, &model, &Unbounded, &Unbounded)?;
