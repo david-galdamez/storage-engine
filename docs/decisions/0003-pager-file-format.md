@@ -299,3 +299,12 @@ is a rule for the layout code, not something the pager enforces.
 `tests/pager_disk.rs` (`open_rejects_changed_reserved_byte_in_page_0`) and
 `tests/pager_file_header.rs` (`decode_ignores_checksum_lsn_and_reserved_bytes`)
 cover this.
+
+## Amendment (2026-11-27): page LSN and the write-ahead log
+
+ADR 0006 uses the page LSN reserved by option 3: `write_page` stamps the LSN
+of the current WAL operation, and 0 still means "written before the WAL". The
+reserved-bytes rule of amendment e no longer covers bytes 8..16 of the common
+header. ADR 0006 also closes the gap of amendment d and the crash items of the
+Consequences: allocation, freeing and file growth become part of one logged
+operation, and the file length changes only after the log is durable.

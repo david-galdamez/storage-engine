@@ -495,3 +495,29 @@ not a violation: invariant 8 guarantees no minimum fill, so trees built by
 right-only appends are valid. Until the WAL exists, `verify` cannot find
 everything a crash leaves behind; it does report leaked pages through
 `verify_file`.
+
+## Amendment 5 (2026-11-27): atomic operations
+
+- Status: proposed (accepted with Phase 3, step 6)
+
+ADR 0006 adds a write-ahead log and `Pager::atomic`. Phase 3, step 6 wraps the
+bodies of `BTree::create`, `put` and `delete` in `pager.atomic`, so each one
+is a single logged operation: every page it writes, allocates or frees,
+including the file header, is committed together or not at all, and is
+recovered after a crash. The split, merge and rebalance code does not change.
+
+Once step 6 lands:
+
+- The paragraph "Write order and crash windows" of amendment 3 (step 11b) and
+  the crash windows in "Write and free order" (step 11a) no longer apply. The
+  write order inside an operation stays as it is, but it is no longer visible
+  after a crash.
+- Invariant 7: "A crash can leak pages but never leaves a cell pointing to a
+  freed page (until the WAL, Phase 3)" becomes "a crash leaves no trace of an
+  unfinished operation".
+- The Consequences item "A crash during a split or an overflow write can leave
+  a tree inconsistent until the WAL exists" is resolved.
+- A failed `put` or `delete` changes nothing. Before, a `put` whose freeing of
+  the old overflow chain failed had already taken effect.
+- Amendment 4: `verify_file` can still report leaked pages, but only from
+  files written before Phase 3 or from bugs, not from crashes.
