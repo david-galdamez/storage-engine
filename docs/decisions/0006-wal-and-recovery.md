@@ -208,9 +208,14 @@ Phase 4.
 
 Errors:
 
-- An error before step 3 completes: the operation is dropped, like an abort.
-  The partial bytes past `wal_end` are overwritten by the next record, and
-  recovery rejects them anyway (CRC, length or LSN).
+- An error before step 2 (encoding): the operation is dropped, like an
+  abort, and the pager stays usable.
+- An error in step 2 (the WAL write): `Wal::append` writes and fsyncs in
+  one call, so a write error cannot be told apart from an fsync error. It
+  poisons the pager too. This is stricter than needed (for example, ENOSPC
+  on the write poisons) but safe. The partial bytes past `wal_end` are
+  overwritten by the next record, and recovery rejects them anyway (CRC,
+  length or LSN).
 - An error in step 3 or later **poisons** the pager. Every later call,
   reads included, returns `PagerError::Poisoned`. Reopening the file runs
   recovery. A failed fsync cannot be retried safely (the kernel may have

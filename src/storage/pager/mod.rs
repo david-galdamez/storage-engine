@@ -8,6 +8,7 @@ pub mod disk;
 pub mod error;
 pub mod file_header;
 pub mod freelist;
+mod op;
 pub mod page;
 pub mod slotted;
 pub mod types;

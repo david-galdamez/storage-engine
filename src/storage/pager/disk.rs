@@ -1,6 +1,7 @@
 //! Disk I/O: reading and writing pages at `page_id * page_size` offsets.
 
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     os::unix::fs::FileExt,
     path::Path,
@@ -11,11 +12,13 @@ use crate::storage::{
         error::PagerError,
         file_header::FileHeader,
         freelist::{decode_free_page, encode_free_page},
-        page::{stamp_checksum, verify_checksum},
+        op::OpState,
+        page::{set_page_lsn, stamp_checksum, verify_checksum},
         types::{PageId, PageSize},
     },
     wal::{
         error::WalError,
+        format::encode_record,
         log::{SyncMode, Wal, wal_path},
         recovery::{RecoveryReport, recover},
     },
@@ -35,6 +38,11 @@ pub struct PagerOptions {
 /// and is managed by the pager itself. The pager stamps the checksum of every
 /// page it writes and verifies it on every page it reads. It does not cache
 /// pages: every call goes to the file.
+///
+/// Every change runs inside an atomic operation (ADR 0006): the changed pages
+/// are held in memory and, at commit, written to the WAL as one record and then
+/// to the file. Public writers called outside [`Pager::atomic`] run as their
+/// own one-call operation (autocommit).
 #[derive(Debug)]
 pub struct Pager {
     /// The database file, open for reading and writing.
@@ -50,6 +58,13 @@ pub struct Pager {
     sync_mode: SyncMode,
     /// What recovery did when this pager was opened.
     recovery: RecoveryReport,
+    /// The operation in progress, if any.
+    op: Option<OpState>,
+    /// Buffer for the encoded WAL record, reused across operations.
+    wal_buf: Vec<u8>,
+    /// Set when a commit failed at or after the WAL fsync. Every later call
+    /// fails with [`PagerError::Poisoned`].
+    poisoned: bool,
 }
 
 impl Pager {
@@ -92,6 +107,9 @@ impl Pager {
             wal,
             sync_mode,
             recovery: RecoveryReport::default(),
+            op: None,
+            wal_buf: Vec::new(),
+            poisoned: false,
         })
     }
 
@@ -158,6 +176,9 @@ impl Pager {
             wal,
             sync_mode,
             recovery,
+            op: None,
+            wal_buf: Vec::new(),
+            poisoned: false,
         };
         pager.file.read_exact_at(&mut pager.scratch, 0)?;
 
@@ -205,16 +226,22 @@ impl Pager {
     /// it with `None`.
     ///
     /// Does not check the type of the page: the tree layer owns that. Does
-    /// not sync.
+    /// not sync. Runs as its own operation unless called inside
+    /// [`Pager::atomic`].
     ///
     /// # Errors
     ///
     /// - [`PagerError::ReservedPage`] if `root` is page 0 (the file header).
     /// - [`PagerError::PageOutOfBounds`] if `root` is not below `page_count`.
     ///   In both cases nothing is written.
-    /// - [`PagerError::Io`] if writing the file header fails. The in-memory
-    ///   header does not change.
+    /// - [`PagerError::Poisoned`] if an earlier commit failed.
+    /// - [`PagerError::Wal`] or [`PagerError::Io`] if the commit fails; see
+    ///   [`Pager::atomic`].
     pub fn set_catalog_root(&mut self, root: Option<PageId>) -> Result<(), PagerError> {
+        self.atomic(|p| p.set_catalog_root_inner(root))
+    }
+
+    fn set_catalog_root_inner(&mut self, root: Option<PageId>) -> Result<(), PagerError> {
         if let Some(page) = root {
             if page.get() == 0 {
                 return Err(PagerError::ReservedPage { page });
@@ -248,7 +275,12 @@ impl Pager {
     /// - [`PagerError::Io`] if the read fails.
     /// - [`PagerError::Corrupted`] with `page_id` if the checksum is wrong. A
     ///   page that was allocated but never written always fails here.
+    /// - [`PagerError::Poisoned`] if an earlier commit failed.
+    ///
+    /// Inside an operation, a page changed earlier in the same operation is
+    /// read from memory (read-your-writes).
     pub fn read_page(&self, page_id: PageId, buffer: &mut [u8]) -> Result<(), PagerError> {
+        self.check_poisoned()?;
         if page_id.get() >= self.file_header.page_count {
             return Err(PagerError::PageOutOfBounds {
                 page: page_id,
@@ -265,7 +297,19 @@ impl Pager {
             });
         }
 
-        self.file.read_exact_at(buffer, page_offset)?;
+        if let Some(op) = &self.op {
+            if let Some(image) = op.dirty.get(&page_id) {
+                buffer.copy_from_slice(image);
+            } else if page_id.get() >= op.header_before.page_count {
+                // Grown in this operation: the file has no bytes there yet.
+                // Behave like the zero-filled page it will become.
+                buffer.fill(0);
+            } else {
+                self.file.read_exact_at(buffer, page_offset)?;
+            }
+        } else {
+            self.file.read_exact_at(buffer, page_offset)?;
+        }
 
         verify_checksum(buffer).map_err(|e| PagerError::Corrupted {
             page: page_id,
@@ -275,10 +319,12 @@ impl Pager {
         Ok(())
     }
 
-    /// Stamps the checksum into `buffer`, then writes it as page `page_id`.
+    /// Stamps the page LSN and the checksum into `buffer`, then writes it as
+    /// page `page_id`.
     ///
-    /// The page must already exist. The write is not durable until
-    /// [`Pager::sync`].
+    /// The page must already exist. Outside [`Pager::atomic`] the write is its
+    /// own operation and is durable (in the WAL) when this returns; inside one
+    /// it is held in memory until the operation commits.
     ///
     /// # Errors
     ///
@@ -286,9 +332,15 @@ impl Pager {
     /// - [`PagerError::ReservedPage`] if `page_id` is 0 (the file header).
     /// - [`PagerError::PageOutOfBounds`] if `page_id` is not below
     ///   `page_count`. Call [`Pager::allocate_page`] first.
-    /// - [`PagerError::Io`] if the write fails. The checksum is already
-    ///   stamped into `buffer` at that point.
+    /// - [`PagerError::Poisoned`] if an earlier commit failed.
+    /// - [`PagerError::Wal`] or [`PagerError::Io`] if the commit fails; see
+    ///   [`Pager::atomic`]. The LSN and checksum are already stamped into
+    ///   `buffer` at that point.
     pub fn write_page(&mut self, page_id: PageId, buffer: &mut [u8]) -> Result<(), PagerError> {
+        self.atomic(|p| p.write_page_inner(page_id, buffer))
+    }
+
+    fn write_page_inner(&mut self, page_id: PageId, buffer: &mut [u8]) -> Result<(), PagerError> {
         if buffer.len() != self.page_size().as_usize() {
             return Err(PagerError::BufferSize {
                 expected: self.page_size().as_usize(),
@@ -307,10 +359,10 @@ impl Pager {
             });
         }
 
+        let op = self.op.as_mut().ok_or(PagerError::NoActiveOperation)?;
+        set_page_lsn(buffer, op.lsn)?;
         stamp_checksum(buffer)?;
-
-        self.file
-            .write_all_at(buffer, page_id.offset(self.page_size()))?;
+        stage_image(op, page_id, buffer);
 
         Ok(())
     }
@@ -322,17 +374,19 @@ impl Pager {
     /// with `freelist_count - 1`. The file does not grow. The returned page
     /// still holds the old free page until the caller writes it.
     ///
-    /// If the free list is empty, grows the file by one page and writes the
-    /// new `page_count` to the file header. The new page is filled with zeros,
-    /// so reading it fails the checksum until its first
-    /// [`Pager::write_page`].
+    /// If the free list is empty, raises `page_count` by one and writes the
+    /// file header. The file itself grows when the operation commits, and the
+    /// new page is filled with zeros, so reading it fails the checksum until
+    /// its first [`Pager::write_page`].
     ///
-    /// Does not sync.
+    /// Does not sync. Runs as its own operation unless called inside
+    /// [`Pager::atomic`].
     ///
     /// # Errors
     ///
     /// When popping the free list, the file and the pager are left unchanged
-    /// on every error:
+    /// on every error (the commit errors of [`Pager::atomic`] and
+    /// [`PagerError::Poisoned`] also apply to every case):
     ///
     /// - [`PagerError::Corrupted`] with the head page if its checksum is
     ///   wrong.
@@ -346,11 +400,11 @@ impl Pager {
     /// When growing the file:
     ///
     /// - [`PagerError::DatabaseFull`] if `page_count` is already `u32::MAX`.
-    /// - [`PagerError::Io`] if growing the file or writing the file header
-    ///   fails. The in-memory `page_count` does not change, but the file may
-    ///   already be one page longer, so a later [`Pager::open`] can fail with
-    ///   [`PagerError::FileSizeMismatch`].
     pub fn allocate_page(&mut self) -> Result<PageId, PagerError> {
+        self.atomic(Self::allocate_page_inner)
+    }
+
+    fn allocate_page_inner(&mut self) -> Result<PageId, PagerError> {
         if self.file_header.freelist_count != 0
             && let Some(head) = self.file_header.freelist_head
         {
@@ -405,12 +459,6 @@ impl Pager {
             .checked_add(1)
             .ok_or(PagerError::DatabaseFull)?;
 
-        let new_len = u64::from(file_header.page_count)
-            .checked_mul(u64::from(self.file_header.page_size.get()))
-            .ok_or(PagerError::DatabaseFull)?;
-
-        self.file.set_len(new_len)?;
-
         self.write_header(&file_header)?;
 
         self.file_header = file_header;
@@ -435,6 +483,7 @@ impl Pager {
     ///   or the list is shorter or longer than `freelist_count`.
     /// - [`PagerError::Io`] if a read fails.
     pub fn verify_freelist(&self) -> Result<(), PagerError> {
+        self.check_poisoned()?;
         let mut current = self.file_header.freelist_head;
         let mut holder = None;
         let mut buffer = vec![0u8; self.page_size().as_usize()];
@@ -484,6 +533,7 @@ impl Pager {
     /// - [`PagerError::Io`] if the operating system cannot flush the file to
     ///   disk.
     pub fn sync(&self) -> Result<(), PagerError> {
+        self.check_poisoned()?;
         if self.sync_mode == SyncMode::Full {
             self.file.sync_all()?;
         }
@@ -500,17 +550,22 @@ impl Pager {
     /// detect a double free: freeing a page twice links it to itself, and
     /// [`Pager::verify_freelist`] reports the cycle. Does not sync.
     ///
-    /// The two writes are not atomic. A crash between them leaves the page
-    /// marked free but outside the list, so it is leaked until the WAL exists.
+    /// Both writes belong to one operation, so a crash leaves both or neither.
+    /// Runs as its own operation unless called inside [`Pager::atomic`].
     ///
     /// # Errors
     ///
     /// - [`PagerError::ReservedPage`] if `page` is 0 (the file header).
     /// - [`PagerError::PageOutOfBounds`] if `page` is not below `page_count`.
     ///   In both cases nothing is written.
-    /// - [`PagerError::Io`] if writing the page or the file header fails. The
-    ///   in-memory header does not change.
+    /// - [`PagerError::Poisoned`] if an earlier commit failed.
+    /// - [`PagerError::Wal`] or [`PagerError::Io`] if the commit fails; see
+    ///   [`Pager::atomic`].
     pub fn free_page(&mut self, page: PageId) -> Result<(), PagerError> {
+        self.atomic(|p| p.free_page_inner(page))
+    }
+
+    fn free_page_inner(&mut self, page: PageId) -> Result<(), PagerError> {
         let page_id = page.get();
         if page_id == 0 {
             return Err(PagerError::ReservedPage { page });
@@ -527,7 +582,7 @@ impl Pager {
         let mut buffer = vec![0u8; self.page_size().as_usize()];
 
         encode_free_page(&mut buffer, self.file_header.freelist_head)?;
-        self.write_page(page, &mut buffer)?;
+        self.write_page_inner(page, &mut buffer)?;
 
         let free_list_cont = self.file_header.freelist_count.saturating_add(1);
         file_header.freelist_count = free_list_cont;
@@ -546,16 +601,144 @@ impl Pager {
         self.file_header.freelist_count
     }
 
-    /// Encodes `header` into the scratch buffer, stamps its checksum, and
-    /// writes it as page 0. Does not update `self.file_header`: the caller
-    /// does that once the write succeeds.
+    /// Encodes `header` into the scratch buffer, stamps its LSN and checksum,
+    /// and stages it as page 0 of the current operation. Does not update
+    /// `self.file_header`: the caller does that once this succeeds.
     fn write_header(&mut self, header: &FileHeader) -> Result<(), PagerError> {
+        let op = self.op.as_mut().ok_or(PagerError::NoActiveOperation)?;
         header.encode(&mut self.scratch)?;
-
+        set_page_lsn(&mut self.scratch, op.lsn)?;
         stamp_checksum(&mut self.scratch)?;
-        self.file.write_all_at(&self.scratch, 0)?;
+        stage_image(op, PageId::HEADER, &self.scratch);
 
         Ok(())
+    }
+
+    /// Runs `f` as one atomic operation (ADR 0006, D4): all of its writes
+    /// reach the database, or none do.
+    ///
+    /// Outside an operation this begins one, runs `f`, and commits if `f`
+    /// returns `Ok` or aborts if it returns `Err`. Abort drops every change
+    /// and restores the in-memory file header, `page_count` included; nothing
+    /// reached either file. Inside an operation `f` simply runs as part of the
+    /// outer one: an `Err` from a nested call only aborts if the caller
+    /// propagates it out of the outer closure.
+    ///
+    /// Commit (D5) encodes one WAL record with every changed page, appends
+    /// and fsyncs it, writes the pages to the database file and sets its
+    /// length. An operation that changed nothing writes no record. This is
+    /// the "no-steal, no-force" policy of _Database Internals_, Ch. 5.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `f` returns, or a [`PagerError`] converted into `E`:
+    ///
+    /// - [`PagerError::Poisoned`] if an earlier commit failed.
+    /// - [`PagerError::Wal`] if the record cannot be encoded (the operation is
+    ///   discarded and the pager stays usable) or cannot be appended or
+    ///   fsynced (the pager is poisoned).
+    /// - [`PagerError::Io`] if applying the pages to the database file fails
+    ///   after the fsync (the pager is poisoned; reopen to recover).
+    pub fn atomic<T, E: From<PagerError>>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.check_poisoned()?;
+        if self.op.is_some() {
+            return f(self);
+        }
+
+        self.op = Some(OpState {
+            dirty: BTreeMap::new(),
+            header_before: self.file_header,
+            lsn: self.wal.next_lsn(),
+        });
+
+        match f(self) {
+            Ok(value) => {
+                self.commit()?;
+                Ok(value)
+            }
+            Err(e) => {
+                self.abort();
+                Err(e)
+            }
+        }
+    }
+
+    const fn check_poisoned(&self) -> Result<(), PagerError> {
+        if self.poisoned {
+            Err(PagerError::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Drops the current operation and restores the in-memory header.
+    fn abort(&mut self) {
+        if let Some(op) = self.op.take() {
+            self.file_header = op.header_before;
+        }
+    }
+
+    /// Makes the current operation durable (ADR 0006, D5).
+    fn commit(&mut self) -> Result<(), PagerError> {
+        let Some(op) = self.op.take() else {
+            return Ok(());
+        };
+        if op.dirty.is_empty() {
+            return Ok(());
+        }
+
+        let encoded = encode_record(
+            &mut self.wal_buf,
+            op.lsn,
+            self.file_header.page_size,
+            op.dirty.iter().map(|(id, image)| (*id, image.as_slice())),
+        );
+        if let Err(e) = encoded {
+            self.file_header = op.header_before;
+            return Err(e.into());
+        }
+
+        // The append writes and fsyncs in one call, so a failure here may be
+        // either; it poisons to be safe (a failed fsync cannot be retried).
+        if let Err(e) = self.wal.append(&self.wal_buf, self.sync_mode) {
+            self.poisoned = true;
+            return Err(e.into());
+        }
+
+        if let Err(e) = self.apply(&op) {
+            self.poisoned = true;
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    /// Writes every image of a committed operation to the database file, then
+    /// sets the file length to `page_count * page_size`.
+    fn apply(&self, op: &OpState) -> Result<(), PagerError> {
+        let page_size = self.page_size();
+        for (id, image) in &op.dirty {
+            self.file.write_all_at(image, id.offset(page_size))?;
+        }
+        let len = u64::from(self.file_header.page_count)
+            .checked_mul(u64::from(page_size.get()))
+            .ok_or(PagerError::DatabaseFull)?;
+        self.file.set_len(len)?;
+
+        Ok(())
+    }
+}
+
+/// Copies `image` into the operation's dirty map, reusing the entry's buffer.
+fn stage_image(op: &mut OpState, id: PageId, image: &[u8]) {
+    if let Some(slot) = op.dirty.get_mut(&id) {
+        slot.clear();
+        slot.extend_from_slice(image);
+    } else {
+        op.dirty.insert(id, image.to_vec());
     }
 }
 
@@ -591,4 +774,40 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{Result, ensure};
+
+    /// Poisoning cannot be triggered from outside (it needs a failing fsync),
+    /// so the test sets the flag and checks that every public entry point
+    /// refuses to run.
+    #[test]
+    fn poisoned_pager_rejects_every_call() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut pager = Pager::create(&dir.path().join("p.db"), PagerOptions::default())?;
+        pager.poisoned = true;
+
+        let mut buf = vec![0u8; pager.page_size().as_usize()];
+        let id = PageId::new(1);
+        ensure!(matches!(
+            pager.read_page(PageId::HEADER, &mut buf),
+            Err(PagerError::Poisoned)
+        ));
+        ensure!(matches!(
+            pager.write_page(id, &mut buf),
+            Err(PagerError::Poisoned)
+        ));
+        ensure!(matches!(pager.allocate_page(), Err(PagerError::Poisoned)));
+        ensure!(matches!(pager.free_page(id), Err(PagerError::Poisoned)));
+        ensure!(matches!(
+            pager.set_catalog_root(None),
+            Err(PagerError::Poisoned)
+        ));
+        ensure!(matches!(pager.sync(), Err(PagerError::Poisoned)));
+        ensure!(matches!(pager.verify_freelist(), Err(PagerError::Poisoned)));
+        Ok(())
+    }
 }

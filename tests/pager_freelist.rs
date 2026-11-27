@@ -38,6 +38,7 @@ use storage_engine_rs::storage::pager::page::{
     PageType, page_lsn, page_type, set_page_lsn, set_page_type,
 };
 use storage_engine_rs::storage::pager::types::{PageId, PageSize};
+use storage_engine_rs::storage::wal::log::wal_path;
 use tempfile::TempDir;
 
 /// Page sizes allowed by ADR 0001 that the tests cover: smallest, default, largest.
@@ -112,9 +113,15 @@ fn file_offset(id: u32, offset: usize) -> anyhow::Result<u64> {
 }
 
 /// Overwrites bytes of the file at `path`, starting at `offset`, without the
-/// pager. Used to simulate corruption.
+/// pager. Used to simulate corruption. Removes the WAL first: without a
+/// checkpoint (step 5) it still holds the pages, and recovery on the next open
+/// would repair the tampering.
 fn patch(path: &Path, offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
     use std::os::unix::fs::FileExt;
+    match fs::remove_file(wal_path(path)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     let file = OpenOptions::new().write(true).open(path)?;
     file.write_all_at(bytes, offset)?;
     Ok(())

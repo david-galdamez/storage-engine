@@ -3,7 +3,7 @@
 use crate::storage::pager::error::PageError;
 
 /// Number of a page in the database file. Page N starts at byte offset N * page size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageId(u32);
 
 impl PageId {

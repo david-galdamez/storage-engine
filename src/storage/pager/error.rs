@@ -144,4 +144,15 @@ pub enum PagerError {
     /// `reason` names the check that failed.
     #[error("Free list with page_id : {page} is corrupted: {reason}")]
     FreelistCorrupted { page: PageId, reason: &'static str },
+
+    /// A commit failed at or after the WAL fsync, so the state of the files is
+    /// unknown (ADR 0006, D5). Every call fails until the file is reopened,
+    /// which runs recovery.
+    #[error("Pager is poisoned by a failed commit; reopen the database")]
+    Poisoned,
+
+    /// A write was attempted outside an operation. Internal invariant: the
+    /// public writers always run inside [`Pager::atomic`](crate::storage::pager::disk::Pager::atomic).
+    #[error("No active operation")]
+    NoActiveOperation,
 }

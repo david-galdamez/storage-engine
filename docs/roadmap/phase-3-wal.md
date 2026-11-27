@@ -52,7 +52,7 @@ See [AGENTS.md](../../AGENTS.md) sections 3 and 4.
 | 1   | WAL codec            | `wal/format.rs`: header and record encode/decode; `LogReader` over a borrowed `&[u8]`        | Ch. 5 Log Semantics; Ch. 3 Checksumming            | Done   |
 | 2   | WAL file             | `wal/log.rs`: `Wal` create, open, append, reset; `SyncMode`; `wal_path`                      | Ch. 5 Write-Ahead Log                              | Done   |
 | 3   | Recovery on open     | `wal/recovery.rs`: replay valid records on `Pager::open`; `create` makes the WAL             | Ch. 5 ARIES (redo only)                            | Done   |
-| 4   | Logged writes        | `Pager::atomic`, autocommit, read-your-writes, deferred growth, page LSN, commit, `Poisoned` | Ch. 5 Steal and Force Policies                     | To do  |
+| 4   | Logged writes        | `Pager::atomic`, autocommit, read-your-writes, deferred growth, page LSN, commit, `Poisoned` | Ch. 5 Steal and Force Policies                     | Done   |
 | 5   | Checkpoint           | `checkpoint()`, `sync()` delegates, threshold, `set_sync_mode`, best-effort `Drop`           | Ch. 5 Checkpoints                                  | To do  |
 | 6   | Atomic B+Tree ops    | Wrap `BTree::create`, `put`, `delete` in `pager.atomic`; ADR 0005 amendment 5 accepted       | Ch. 5; Ch. 4 Propagating Splits and Merges         | To do  |
 | 7   | Crash tests          | WAL cut at every byte, partial and torn page applies, `verify_file` clean after each case    | Ch. 5 Recovery                                     | To do  |
