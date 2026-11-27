@@ -18,11 +18,14 @@ use crate::storage::{
     },
     wal::{
         error::WalError,
-        format::encode_record,
+        format::{HEADER_SIZE, encode_record},
         log::{SyncMode, Wal, wal_path},
         recovery::{RecoveryReport, recover},
     },
 };
+
+/// WAL length (4 MiB) above which a commit triggers a checkpoint (ADR 0006, D8).
+const DEFAULT_CHECKPOINT_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 /// Options for creating a new database file with [`Pager::create`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -54,8 +57,11 @@ pub struct Pager {
     scratch: Box<[u8]>,
     /// The write-ahead log (ADR 0006). Empty in normal use until step 4.
     wal: Wal,
-    /// Whether fsyncs happen. Always `Full` until step 5 adds a setter.
+    /// Whether fsyncs happen. `Full` unless [`Pager::set_sync_mode`] changed it.
     sync_mode: SyncMode,
+    /// A commit that leaves the WAL longer than this many bytes triggers a
+    /// checkpoint. `u64::MAX` disables it.
+    checkpoint_threshold: u64,
     /// What recovery did when this pager was opened.
     recovery: RecoveryReport,
     /// The operation in progress, if any.
@@ -106,6 +112,7 @@ impl Pager {
             scratch,
             wal,
             sync_mode,
+            checkpoint_threshold: DEFAULT_CHECKPOINT_THRESHOLD,
             recovery: RecoveryReport::default(),
             op: None,
             wal_buf: Vec::new(),
@@ -175,6 +182,7 @@ impl Pager {
             scratch: vec![0u8; file_header.page_size.as_usize()].into_boxed_slice(),
             wal,
             sync_mode,
+            checkpoint_threshold: DEFAULT_CHECKPOINT_THRESHOLD,
             recovery,
             op: None,
             wal_buf: Vec::new(),
@@ -525,20 +533,75 @@ impl Pager {
         Ok(())
     }
 
-    /// Flushes every write to the file down to the disk (`fsync`), so it
-    /// survives a crash or power loss.
+    /// Makes every committed write durable in the database file and empties
+    /// the WAL. Same as [`Pager::checkpoint`]; kept so call sites stay.
     ///
     /// # Errors
     ///
-    /// - [`PagerError::Io`] if the operating system cannot flush the file to
-    ///   disk.
-    pub fn sync(&self) -> Result<(), PagerError> {
-        self.check_poisoned()?;
-        if self.sync_mode == SyncMode::Full {
-            self.file.sync_all()?;
-        }
+    /// The errors of [`Pager::checkpoint`].
+    pub fn sync(&mut self) -> Result<(), PagerError> {
+        self.checkpoint()
+    }
 
+    /// Checkpoint (ADR 0006, D8; _Database Internals_, Ch. 5): fsyncs the
+    /// database file, then resets the WAL (header rewritten with a raised
+    /// `base_lsn`, fsync, truncate to the header), so LSNs keep increasing.
+    ///
+    /// Does nothing when the WAL holds no records: every write to the database
+    /// file comes from a commit that went through the WAL, so an empty WAL
+    /// means the file was already synced by the last checkpoint or by recovery.
+    ///
+    /// # Errors
+    ///
+    /// - [`PagerError::Poisoned`] if an earlier commit failed.
+    /// - [`PagerError::OperationInProgress`] if called inside
+    ///   [`Pager::atomic`]. The pager is left as it was.
+    /// - [`PagerError::Io`] if the database fsync fails, or [`PagerError::Wal`]
+    ///   if the WAL reset fails. Both poison the pager: a failed fsync cannot
+    ///   be retried, and a half-done reset would let a later append write a
+    ///   record that recovery rejects. The WAL is never truncated before the
+    ///   database file is synced, so reopening recovers everything.
+    pub fn checkpoint(&mut self) -> Result<(), PagerError> {
+        self.check_poisoned()?;
+        if self.op.is_some() {
+            return Err(PagerError::OperationInProgress);
+        }
+        self.checkpoint_inner()
+    }
+
+    fn checkpoint_inner(&mut self) -> Result<(), PagerError> {
+        if self.wal.end() <= u64::try_from(HEADER_SIZE).unwrap_or(u64::MAX) {
+            return Ok(());
+        }
+        if self.sync_mode == SyncMode::Full
+            && let Err(e) = self.file.sync_all()
+        {
+            self.poisoned = true;
+            return Err(e.into());
+        }
+        if let Err(e) = self.wal.reset(self.sync_mode) {
+            self.poisoned = true;
+            return Err(e.into());
+        }
         Ok(())
+    }
+
+    /// Sets the WAL length (in bytes) above which a successful commit runs a
+    /// checkpoint. The default is 4 MiB; `u64::MAX` means never.
+    pub const fn set_checkpoint_threshold(&mut self, bytes: u64) {
+        self.checkpoint_threshold = bytes;
+    }
+
+    /// Chooses whether the pager fsyncs. [`SyncMode::Off`] keeps the write
+    /// order but gives up durability: it is for tests only.
+    pub const fn set_sync_mode(&mut self, mode: SyncMode) {
+        self.sync_mode = mode;
+    }
+
+    /// The current sync mode.
+    #[must_use]
+    pub const fn sync_mode(&self) -> SyncMode {
+        self.sync_mode
     }
 
     /// Pushes `page` onto the free list so a later [`Pager::allocate_page`]
@@ -639,6 +702,9 @@ impl Pager {
     ///   fsynced (the pager is poisoned).
     /// - [`PagerError::Io`] if applying the pages to the database file fails
     ///   after the fsync (the pager is poisoned; reopen to recover).
+    /// - [`PagerError::Io`] or [`PagerError::Wal`] if the automatic checkpoint
+    ///   after the commit fails. The operation is already durable in the WAL;
+    ///   the pager is poisoned and reopening recovers it.
     pub fn atomic<T, E: From<PagerError>>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, E>,
@@ -713,6 +779,13 @@ impl Pager {
             return Err(e);
         }
 
+        // The operation is durable now. If this checkpoint fails the error is
+        // still returned (the pager is poisoned by then); the caller must
+        // reopen, and recovery shows the operation was committed.
+        if self.wal.end() > self.checkpoint_threshold {
+            self.checkpoint_inner()?;
+        }
+
         Ok(())
     }
 
@@ -729,6 +802,18 @@ impl Pager {
         self.file.set_len(len)?;
 
         Ok(())
+    }
+}
+
+impl Drop for Pager {
+    /// Best-effort checkpoint, skipped when the pager is poisoned or an
+    /// operation is open. The error is ignored on purpose: a failed checkpoint
+    /// never truncates the WAL before the database file is synced, so the next
+    /// open recovers by replaying it.
+    fn drop(&mut self) {
+        if !self.poisoned && self.op.is_none() {
+            let _ = self.checkpoint_inner();
+        }
     }
 }
 
@@ -807,7 +892,26 @@ mod tests {
             Err(PagerError::Poisoned)
         ));
         ensure!(matches!(pager.sync(), Err(PagerError::Poisoned)));
+        ensure!(matches!(pager.checkpoint(), Err(PagerError::Poisoned)));
         ensure!(matches!(pager.verify_freelist(), Err(PagerError::Poisoned)));
+        Ok(())
+    }
+
+    /// A poisoned pager must not checkpoint when dropped: its WAL may hold
+    /// commits that never reached the database file.
+    #[test]
+    fn poisoned_drop_does_not_checkpoint() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("p.db");
+        let wal = wal_path(&path);
+        let mut pager = Pager::create(&path, PagerOptions::default())?;
+        pager.set_checkpoint_threshold(u64::MAX);
+        pager.allocate_page()?;
+        let len = std::fs::metadata(&wal)?.len();
+        ensure!(len > 32);
+        pager.poisoned = true;
+        drop(pager);
+        ensure!(std::fs::metadata(&wal)?.len() == len);
         Ok(())
     }
 }

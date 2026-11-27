@@ -64,7 +64,6 @@ use storage_engine_rs::storage::pager::page::{
     PageType, set_page_lsn, set_page_type, verify_checksum,
 };
 use storage_engine_rs::storage::pager::types::{PageId, PageSize};
-use storage_engine_rs::storage::wal::log::wal_path;
 use tempfile::TempDir;
 
 /// Page sizes allowed by ADR 0001 that the tests cover: smallest, default, largest.
@@ -362,9 +361,8 @@ fn open_rejects_truncated_file() -> anyhow::Result<()> {
     // Three pages of 512 bytes, then the last byte is lost.
     let (_dir, path) = temp_db()?;
     drop(create_with_pages(&path, 512, 2)?);
-    // No checkpoint yet (step 5): drop the leftover WAL so recovery does not
-    // repair the length.
-    fs::remove_file(wal_path(&path))?;
+    // Dropping the pager checkpointed, so the WAL is empty and recovery does
+    // not repair the length.
     set_file_len(&path, 1535)?;
     let err = open_err(&path)?;
     ensure!(
@@ -384,9 +382,8 @@ fn open_rejects_truncated_file() -> anyhow::Result<()> {
 fn open_rejects_file_with_extra_bytes() -> anyhow::Result<()> {
     let (_dir, path) = temp_db()?;
     drop(create_with_pages(&path, 512, 2)?);
-    // No checkpoint yet (step 5): drop the leftover WAL so recovery does not
-    // repair the length.
-    fs::remove_file(wal_path(&path))?;
+    // Dropping the pager checkpointed, so the WAL is empty and recovery does
+    // not repair the length.
     set_file_len(&path, 1537)?;
     let err = open_err(&path)?;
     ensure!(

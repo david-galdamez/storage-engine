@@ -58,6 +58,7 @@ use storage_engine_rs::storage::pager::file_header::FileHeader;
 use storage_engine_rs::storage::pager::freelist::decode_free_page;
 use storage_engine_rs::storage::pager::slotted::{SLOT_SIZE, SLOTTED_HEADER_SIZE, SlottedPageMut};
 use storage_engine_rs::storage::pager::types::{PageId, PageSize};
+use storage_engine_rs::storage::wal::log::SyncMode;
 
 /// What the model knows about one page (never page 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,6 +576,7 @@ fn apply(pager: &mut Pager, model: &mut Model, path: &Path, op: &Op) -> anyhow::
         Op::Reopen => {
             pager.sync()?;
             *pager = Pager::open(path)?;
+            pager.set_sync_mode(SyncMode::Off);
             check_full(pager, model, path)?;
         }
         Op::Verify => pager.verify_freelist()?,
@@ -590,6 +592,7 @@ fn run(page_size: u32, ops: &[Op]) -> anyhow::Result<()> {
         page_size: PageSize::new(page_size)?,
     };
     let mut pager = Pager::create(&path, options)?;
+    pager.set_sync_mode(SyncMode::Off);
     let mut model = Model::new(page_size)?;
     check_cheap(&pager, &model, &path)?;
     for (i, op) in ops.iter().enumerate() {

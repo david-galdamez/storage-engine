@@ -155,4 +155,11 @@ pub enum PagerError {
     /// public writers always run inside [`Pager::atomic`](crate::storage::pager::disk::Pager::atomic).
     #[error("No active operation")]
     NoActiveOperation,
+
+    /// A checkpoint was requested while an atomic operation is open. The
+    /// operation's pages are not in the WAL yet, so the WAL cannot be reset.
+    /// Reachable through the `&mut Pager` handed to the closure of
+    /// [`Pager::atomic`](crate::storage::pager::disk::Pager::atomic).
+    #[error("Cannot checkpoint inside an atomic operation")]
+    OperationInProgress,
 }

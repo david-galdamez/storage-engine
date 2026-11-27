@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use storage_engine_rs::storage::pager::disk::{Pager, PagerOptions};
 use storage_engine_rs::storage::pager::types::PageSize;
+use storage_engine_rs::storage::wal::log::SyncMode;
 use tempfile::TempDir;
 
 pub const PAGE_SIZE: usize = 512;
@@ -22,11 +23,15 @@ pub fn temp_db() -> anyhow::Result<(TempDir, PathBuf)> {
     Ok((dir, path))
 }
 
+/// Creates a pager with fsyncs off (`SyncMode::Off`): the B+Tree tests check
+/// structure, not durability, and an fsync per commit makes them slow.
 pub fn new_pager(path: &Path) -> anyhow::Result<Pager> {
-    Ok(Pager::create(
+    let mut pager = Pager::create(
         path,
         PagerOptions {
             page_size: page_size()?,
         },
-    )?)
+    )?;
+    pager.set_sync_mode(SyncMode::Off);
+    Ok(pager)
 }

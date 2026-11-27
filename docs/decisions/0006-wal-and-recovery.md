@@ -243,6 +243,13 @@ Crash safety at each point:
   file but every one fails the LSN check, because a stale record at offset
   `o` has `lsn = old_base + o < new_base + o`.
 
+A failed checkpoint poisons the pager. A failed database `fsync` cannot be
+retried (as in the commit protocol). A failed WAL reset leaves the on-disk
+header possibly ahead of the in-memory one, or stale records before `wal_end`,
+so the next record could be rejected by recovery and a committed operation
+lost. The WAL is never truncated before the database `fsync`, so reopening
+recovers everything.
+
 When it runs:
 
 - After a commit, when `wal_end` passed the threshold (default 4 MiB, set with

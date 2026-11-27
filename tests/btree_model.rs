@@ -33,6 +33,7 @@ use storage_engine_rs::storage::btree::overflow::read_value;
 use storage_engine_rs::storage::btree::{BTree, BTreeEngine, verify_file, verify_tree};
 use storage_engine_rs::storage::engine::{Direction, EngineCursor, StorageEngine};
 use storage_engine_rs::storage::pager::disk::Pager;
+use storage_engine_rs::storage::wal::log::SyncMode;
 
 /// Number of distinct keys.
 const KEYS: usize = 200;
@@ -233,6 +234,7 @@ fn run_single(ops: &[Op]) -> anyhow::Result<()> {
                 pager.sync()?;
                 drop(pager);
                 pager = Pager::open(&path)?;
+                pager.set_sync_mode(SyncMode::Off);
                 tree = BTree::open(&pager, tree.root())?;
             }
         }
@@ -261,13 +263,15 @@ proptest! {
 // ----------------------------------------------------------- many trees
 
 fn reopen_engine(
-    engine: BTreeEngine,
+    mut engine: BTreeEngine,
     path: &Path,
     trees: &[BTree],
 ) -> anyhow::Result<(BTreeEngine, Vec<BTree>)> {
     engine.sync()?;
     drop(engine.into_pager());
-    let engine = BTreeEngine::new(Pager::open(path)?);
+    let mut reopened = Pager::open(path)?;
+    reopened.set_sync_mode(SyncMode::Off);
+    let engine = BTreeEngine::new(reopened);
     let trees = trees
         .iter()
         .map(|tree| engine.open_tree(tree.root()))

@@ -4,10 +4,10 @@
 //! tree handle is a [`BTree`], a root page id. Every operation writes straight
 //! to the file through the pager: nothing is buffered in the engine.
 //!
-//! - [`BTreeEngine::sync`] is only an `fsync`; it does not flush anything
-//!   else. Dropping the engine does not sync.
-//! - There is no write-ahead log yet, so a crash in the middle of a split can
-//!   still corrupt the file until the WAL arrives (Phase 3).
+//! - [`BTreeEngine::sync`] checkpoints the pager. Every operation is already
+//!   durable in the WAL; dropping the engine checkpoints on a best-effort basis.
+//! - Each operation is atomic through the pager's WAL, so a crash in the
+//!   middle of a split is recovered on the next open.
 //! - [`StorageEngine::scan`] returns a [`BTreeScan`], which wraps the B+Tree
 //!   [`Cursor`] and reads a value (inline or from an overflow chain) only when
 //!   the caller passes a buffer for it.
@@ -45,14 +45,21 @@ impl BTreeEngine {
         BTree::open(&self.pager, root)
     }
 
-    /// Flushes the file to stable storage (`fsync`). It does not write
-    /// anything itself: every operation already wrote to the file.
+    /// Checkpoints the pager: fsyncs the file and empties the WAL (ADR 0006).
+    /// Every operation is already durable in the WAL; this only bounds its
+    /// size and the recovery time.
     ///
     /// # Errors
     ///
     /// Returns [`BTreeError::Pager`] if the sync fails.
-    pub fn sync(&self) -> Result<(), BTreeError> {
+    pub fn sync(&mut self) -> Result<(), BTreeError> {
         Ok(self.pager.sync()?)
+    }
+
+    /// Mutably borrows the pager under the engine (to change its sync mode or
+    /// checkpoint threshold).
+    pub const fn pager_mut(&mut self) -> &mut Pager {
+        &mut self.pager
     }
 
     /// Borrows the pager under the engine.
