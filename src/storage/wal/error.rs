@@ -1,12 +1,12 @@
-//! Typed errors for the WAL codec.
+//! Typed errors for the WAL codec and file.
 
 use crate::storage::pager::error::PageError;
 
-/// Errors from encoding and decoding the WAL header and records.
+/// Errors from the WAL header, records and file.
 ///
 /// A torn or corrupt record in the log is not an error: the reader treats it as
 /// the end of the log (ADR 0006).
-#[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum WalError {
     /// The WAL header is too short or its CRC32 does not match.
     #[error("corrupt WAL header")]
@@ -55,4 +55,8 @@ pub enum WalError {
     /// A low-level codec failure (buffer too short, invalid page size).
     #[error(transparent)]
     Page(#[from] PageError),
+
+    /// An I/O error on the WAL file.
+    #[error("WAL I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }

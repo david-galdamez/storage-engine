@@ -1,6 +1,7 @@
 //! Write-ahead log: on-disk format of the WAL file (ADR 0006).
 //!
-//! This module holds the byte-level codec only. File I/O comes in later steps.
+//! `format` is the byte-level codec; `log` is the WAL file itself.
 
 pub mod error;
 pub mod format;
+pub mod log;

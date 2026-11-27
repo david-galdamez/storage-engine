@@ -567,8 +567,14 @@ mod tests {
         ));
         let mut bad = good.clone();
         *bad.get_mut(16).context("pos")? ^= 1;
-        ensure!(WalHeader::decode(&bad) == Err(WalError::CorruptHeader));
-        ensure!(WalHeader::decode(good.get(..31).context("len")?) == Err(WalError::CorruptHeader));
+        ensure!(matches!(
+            WalHeader::decode(&bad),
+            Err(WalError::CorruptHeader)
+        ));
+        ensure!(matches!(
+            WalHeader::decode(good.get(..31).context("len")?),
+            Err(WalError::CorruptHeader)
+        ));
         ensure!(LogReader::new(&[]).is_err());
         Ok(())
     }
@@ -585,7 +591,7 @@ mod tests {
         );
         ensure!(matches!(err, Err(WalError::ImageLength { .. })) && out.is_empty());
         let err = encode_record(&mut out, 32, page_size()?, std::iter::empty());
-        ensure!(err == Err(WalError::EmptyRecord));
+        ensure!(matches!(err, Err(WalError::EmptyRecord)));
         Ok(())
     }
 }
