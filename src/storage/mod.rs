@@ -3,3 +3,4 @@
 pub mod btree;
 pub mod engine;
 pub mod pager;
+pub mod wal;
