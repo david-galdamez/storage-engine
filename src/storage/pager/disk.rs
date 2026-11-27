@@ -6,12 +6,19 @@ use std::{
     path::Path,
 };
 
-use crate::storage::pager::{
-    error::PagerError,
-    file_header::FileHeader,
-    freelist::{decode_free_page, encode_free_page},
-    page::{stamp_checksum, verify_checksum},
-    types::{PageId, PageSize},
+use crate::storage::{
+    pager::{
+        error::PagerError,
+        file_header::FileHeader,
+        freelist::{decode_free_page, encode_free_page},
+        page::{stamp_checksum, verify_checksum},
+        types::{PageId, PageSize},
+    },
+    wal::{
+        error::WalError,
+        log::{SyncMode, Wal, wal_path},
+        recovery::{RecoveryReport, recover},
+    },
 };
 
 /// Options for creating a new database file with [`Pager::create`].
@@ -37,6 +44,12 @@ pub struct Pager {
     /// One page of reusable memory for writing page 0, so updating the header
     /// does not allocate.
     scratch: Box<[u8]>,
+    /// The write-ahead log (ADR 0006). Empty in normal use until step 4.
+    wal: Wal,
+    /// Whether fsyncs happen. Always `Full` until step 5 adds a setter.
+    sync_mode: SyncMode,
+    /// What recovery did when this pager was opened.
+    recovery: RecoveryReport,
 }
 
 impl Pager {
@@ -47,22 +60,39 @@ impl Pager {
     ///
     /// - [`PagerError::Io`] if the file already exists
     ///   ([`std::io::ErrorKind::AlreadyExists`]), or if creating it, writing
-    ///   page 0, or syncing fails.
+    ///   page 0, or syncing fails. Also [`std::io::ErrorKind::AlreadyExists`]
+    ///   if a `-wal` file is already there: a stale log must never be replayed
+    ///   into a new database, so it is refused before anything is created.
+    /// - [`PagerError::Wal`] if creating the WAL fails.
     pub fn create(path: &Path, pager_option: PagerOptions) -> Result<Self, PagerError> {
+        let wal_file = wal_path(path);
+        if wal_file.try_exists()? {
+            return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
+        }
         let file = File::create_new(path)?;
+        let sync_mode = SyncMode::Full;
 
         let file_header = FileHeader::new(pager_option.page_size);
 
-        let mut pager = Self {
+        // Write and fsync page 0 first, then the WAL, then the directory so
+        // both new entries survive a crash (ADR 0006, "Creating a database").
+        let mut scratch = vec![0u8; pager_option.page_size.as_usize()].into_boxed_slice();
+        file_header.encode(&mut scratch)?;
+        stamp_checksum(&mut scratch)?;
+        file.write_all_at(&scratch, 0)?;
+        file.sync_all()?;
+
+        let wal = Wal::create(&wal_file, pager_option.page_size, sync_mode)?;
+        sync_parent_dir(path)?;
+
+        Ok(Self {
             file,
             file_header,
-            scratch: vec![0u8; pager_option.page_size.as_usize()].into_boxed_slice(),
-        };
-
-        pager.write_header(&file_header)?;
-        pager.sync()?;
-
-        Ok(pager)
+            scratch,
+            wal,
+            sync_mode,
+            recovery: RecoveryReport::default(),
+        })
     }
 
     /// Opens an existing database file at `path` and validates it: the file
@@ -73,6 +103,8 @@ impl Pager {
     ///
     /// The checks run in this order, and the first one that fails is returned:
     ///
+    /// - [`PagerError::Wal`] if the WAL header is corrupt or its page size
+    ///   differs from the database's. Checked first, during recovery.
     /// - [`PagerError::Io`] if the file does not exist, cannot be opened for
     ///   reading and writing, or a read fails.
     /// - [`PagerError::FileTooSmall`] if the file is shorter than 512 bytes.
@@ -86,6 +118,14 @@ impl Pager {
     ///   if the checksum of the whole page 0 is wrong.
     pub fn open(path: &Path) -> Result<Self, PagerError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let sync_mode = SyncMode::Full;
+
+        // Recovery runs before the checks below: replay may repair a torn
+        // page 0 or fix the file length (ADR 0006, "Recovery").
+        let mut wal = open_or_create_wal(&file, path, sync_mode)?;
+        let mut wal_buf = Vec::new();
+        let recovery = recover(&file, &mut wal, sync_mode, &mut wal_buf)?;
+
         let file_len = file.metadata()?.len();
         if file_len < u64::from(PageSize::MIN) {
             return Err(PagerError::FileTooSmall { len: file_len });
@@ -115,6 +155,9 @@ impl Pager {
             file,
             file_header,
             scratch: vec![0u8; file_header.page_size.as_usize()].into_boxed_slice(),
+            wal,
+            sync_mode,
+            recovery,
         };
         pager.file.read_exact_at(&mut pager.scratch, 0)?;
 
@@ -124,6 +167,18 @@ impl Pager {
         })?;
 
         Ok(pager)
+    }
+
+    /// What recovery did when this pager was opened (all zero after `create`).
+    #[must_use]
+    pub const fn recovery_report(&self) -> RecoveryReport {
+        self.recovery
+    }
+
+    /// The write-ahead log of this database (read-only view).
+    #[must_use]
+    pub const fn wal(&self) -> &Wal {
+        &self.wal
     }
 
     /// Returns the size of every page in the file.
@@ -429,7 +484,9 @@ impl Pager {
     /// - [`PagerError::Io`] if the operating system cannot flush the file to
     ///   disk.
     pub fn sync(&self) -> Result<(), PagerError> {
-        self.file.sync_all()?;
+        if self.sync_mode == SyncMode::Full {
+            self.file.sync_all()?;
+        }
 
         Ok(())
     }
@@ -500,4 +557,38 @@ impl Pager {
 
         Ok(())
     }
+}
+
+/// Opens the WAL next to `path`. A missing WAL (a Phase 2 file, or a crash
+/// between creating the database and the WAL) is created with `base_lsn = 0`,
+/// taking the page size from the database header.
+fn open_or_create_wal(file: &File, path: &Path, sync: SyncMode) -> Result<Wal, PagerError> {
+    let wal_file = wal_path(path);
+    match Wal::open(&wal_file) {
+        Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            let len = file.metadata()?.len();
+            if len < u64::from(PageSize::MIN) {
+                return Err(PagerError::FileTooSmall { len });
+            }
+            let mut prefix = [0u8; 512];
+            file.read_exact_at(&mut prefix, 0)?;
+            let header = FileHeader::decode(&prefix).map_err(|source| PagerError::Corrupted {
+                page: PageId::new(0),
+                source,
+            })?;
+            let wal = Wal::create(&wal_file, header.page_size, sync)?;
+            sync_parent_dir(path)?;
+            Ok(wal)
+        }
+        other => Ok(other?),
+    }
+}
+
+/// fsyncs the directory that holds `path` (`.` when the path has no parent).
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(dir)?.sync_all()
 }

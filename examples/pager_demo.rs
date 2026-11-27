@@ -29,6 +29,7 @@ use storage_engine_rs::storage::pager::disk::{Pager, PagerOptions};
 use storage_engine_rs::storage::pager::page::{PageType, page_type};
 use storage_engine_rs::storage::pager::slotted::{SlottedPage, SlottedPageMut};
 use storage_engine_rs::storage::pager::types::{PageId, PageSize};
+use storage_engine_rs::storage::wal::log::wal_path;
 
 /// Words inserted in this order, each at its sorted position.
 const WORDS: [&str; 3] = ["cherry", "apple", "banana"];
@@ -54,15 +55,19 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let page_size = PageSize::new(args.page_size).context("invalid --page-size")?;
 
-    if args.path.exists() {
+    let wal = wal_path(&args.path);
+    if args.path.exists() || wal.exists() {
         if !args.force {
             bail!(
                 "{} already exists; pass --force to delete it first",
                 args.path.display()
             );
         }
-        fs::remove_file(&args.path)
-            .with_context(|| format!("cannot delete {}", args.path.display()))?;
+        for p in [&args.path, &wal] {
+            if p.exists() {
+                fs::remove_file(p).with_context(|| format!("cannot delete {}", p.display()))?;
+            }
+        }
     }
 
     write_demo(&args.path, page_size)?;

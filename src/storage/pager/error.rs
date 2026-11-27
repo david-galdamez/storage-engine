@@ -1,6 +1,9 @@
 //! Typed errors for the pager.
 
-use crate::storage::pager::{page::PageType, types::PageId};
+use crate::storage::{
+    pager::{page::PageType, types::PageId},
+    wal::error::WalError,
+};
 
 /// Errors from encoding, decoding, and validating page contents in memory (no I/O).
 #[derive(Debug, Clone, Copy, thiserror::Error, PartialEq, Eq)]
@@ -88,6 +91,9 @@ pub enum PagerError {
     /// An operating-system I/O error.
     #[error("Io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The write-ahead log failed: corrupt header, page size mismatch, or I/O.
+    #[error("WAL error: {0}")]
+    Wal(#[from] WalError),
     /// A page or header could not be decoded or encoded.
     #[error("Format error: {0}")]
     Format(#[from] PageError),
